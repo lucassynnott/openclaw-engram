@@ -30,10 +30,149 @@ const ENTITY_QUERY_HINT_TAIL_RE =
   /\b(?:wer ist|wer war|who is|who was|about|über|ueber|tell me about|was weißt du über|was weisst du über)\s+(.+)$/i;
 const WELL_KNOWN_NAMES_RE = /(?!x)x/gi; // configurable — no hardcoded names
 const PROPER_NAME_RE = /\b[A-ZÄÖÜ][a-zäöüß][A-Za-zÄÖÜäöüß0-9-]{1,}\b/g;
+const COMMON_ENGLISH_CONTENT_WORDS = new Set([
+  "again",
+  "back",
+  "batch",
+  "before",
+  "bridge",
+  "build",
+  "built",
+  "call",
+  "change",
+  "changes",
+  "check",
+  "checks",
+  "cleanup",
+  "code",
+  "command",
+  "commands",
+  "commit",
+  "config",
+  "configs",
+  "context",
+  "conversation",
+  "copy",
+  "current",
+  "currently",
+  "data",
+  "default",
+  "delete",
+  "deploy",
+  "deployment",
+  "detail",
+  "details",
+  "diff",
+  "docs",
+  "done",
+  "error",
+  "errors",
+  "expand",
+  "file",
+  "files",
+  "filter",
+  "fix",
+  "fixed",
+  "flow",
+  "follow",
+  "grant",
+  "grants",
+  "graph",
+  "group",
+  "hand",
+  "health",
+  "history",
+  "index",
+  "issue",
+  "issues",
+  "item",
+  "items",
+  "job",
+  "jobs",
+  "latest",
+  "layer",
+  "line",
+  "lines",
+  "link",
+  "links",
+  "load",
+  "log",
+  "logs",
+  "memory",
+  "merge",
+  "message",
+  "messages",
+  "mode",
+  "model",
+  "models",
+  "note",
+  "notes",
+  "ops",
+  "output",
+  "path",
+  "paths",
+  "pattern",
+  "patterns",
+  "phase",
+  "plan",
+  "plugin",
+  "plugins",
+  "query",
+  "queries",
+  "record",
+  "records",
+  "repo",
+  "report",
+  "result",
+  "results",
+  "review",
+  "run",
+  "scope",
+  "search",
+  "session",
+  "setup",
+  "sha",
+  "slot",
+  "slots",
+  "state",
+  "status",
+  "step",
+  "steps",
+  "store",
+  "stored",
+  "stores",
+  "summary",
+  "sync",
+  "system",
+  "task",
+  "tasks",
+  "test",
+  "tests",
+  "timestamp",
+  "tool",
+  "tools",
+  "topic",
+  "trace",
+  "update",
+  "updates",
+  "url",
+  "urls",
+  "user",
+  "users",
+  "value",
+  "values",
+  "vector",
+  "vectors",
+  "vault",
+  "version",
+  "working",
+  "world",
+]);
 const COMMON_NON_PERSON_TOKENS = new Set([
   "active",
   "always",
   "broken",
+  ...COMMON_ENGLISH_CONTENT_WORDS,
   "current",
   "currently",
   "default",
@@ -110,6 +249,84 @@ const clamp01 = (value: unknown): number =>
 const escapeRegex = (value: unknown): string =>
   String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const splitSentences = (value: unknown): string[] =>
+  String(value || "")
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+const findCandidateLocalContext = (content: unknown, candidate: unknown): string => {
+  const text = String(content || "");
+  const key = String(candidate || "").trim();
+  if (!text || !key) return "";
+  const relevant = splitSentences(text).filter((sentence) =>
+    containsEntity(sentence, key, true),
+  );
+  return relevant.join(" ").trim() || text;
+};
+
+const countCandidateOccurrences = (content: unknown, candidate: unknown): number => {
+  const text = normalizeContent(content);
+  const key = normalizeContent(candidate);
+  if (!text || !key) return 0;
+  const re = new RegExp(
+    `(^|[^\\p{L}\\p{N}_])${escapeRegex(key)}([^\\p{L}\\p{N}_]|$)`,
+    "giu",
+  );
+  let matches = 0;
+  while (re.exec(text)) matches += 1;
+  return matches;
+};
+
+const hasHumanUsagePattern = (content: unknown, candidate: unknown): boolean => {
+  const text = normalizeContent(content);
+  const key = normalizeContent(candidate)
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => escapeRegex(token))
+    .join("\\s+");
+  if (!text || !key) return false;
+  const patterns = [
+    new RegExp(
+      `\\b(?:my|our|his|her|their)\\s+(?:partner(?:in)?|friend|wife|husband|girlfriend|boyfriend)\\s+${key}\\b`,
+      "iu",
+    ),
+    new RegExp(
+      `\\b(?:met|meet|with|about|from|ask|asked|page|paged|ping|pinged|message|messaged|email|emailed|call|called|contact|contacted|tell|told|tell me about|who is|wer ist|ueber|über)\\s+${key}\\b`,
+      "iu",
+    ),
+    new RegExp(
+      `\\b${key}\\s+(?:(?:will|would|can)\\s+)?(?:say|said|ask|asked|reply|replied|message|messaged|call|called|email|emailed|work|works|worked|live|lives|lived|prefer|prefers|like|likes|love|loves|hate|hates|date|dates|join|joined|help|helped|support|supports|manage|manages|lead|leads|want|wants|plan|plans|request|requested|approve|approved|review|reviewed|verify|verified|confirm|confirmed|coordinate|coordinated|handle|handled|page|paged|ping|pinged)\\b`,
+      "iu",
+    ),
+    new RegExp(`\\b${key}\\s+(?:is|was)\\s+(?:a|an)\\b`, "iu"),
+    new RegExp(
+      `\\b${key}\\s+(?:is|was)\\s+(?:working|building|leading|coordinating|handling|reviewing|debugging|fixing|pushing)\\b`,
+      "iu",
+    ),
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+};
+
+const classifyMentionRoleForEntity = (
+  content: unknown,
+  entityKey: unknown,
+): "relationship" | "public_profile" | "ops_noise" | "general" =>
+  classifyPersonRole(findCandidateLocalContext(content, entityKey));
+
+const isSupportedSingleTokenNameCandidate = (
+  content: unknown,
+  original: string,
+  normalized: string,
+): boolean => {
+  if (!isLikelyStandaloneNameCandidate(original, normalized)) return false;
+  const localContext = findCandidateLocalContext(content, original);
+  const localRole = classifyPersonRole(localContext);
+  if (localRole === "relationship" || localRole === "public_profile") return true;
+  if (countCandidateOccurrences(content, original) >= 2) return true;
+  return hasHumanUsagePattern(localContext, original);
+};
+
 // ---------------------------------------------------------------------------
 // Exported functions
 // ---------------------------------------------------------------------------
@@ -158,7 +375,7 @@ const splitNameCandidates = (value: unknown): string[] => {
   const proper = text.match(/\b[A-ZÄÖÜ][a-zäöüß]{2,}\b/g) || [];
   for (const item of proper) {
     const normalized = normalizeContent(item);
-    if (!isLikelyStandaloneNameCandidate(item, normalized)) continue;
+    if (!isSupportedSingleTokenNameCandidate(text, item, normalized)) continue;
     out.add(normalized);
   }
 
@@ -311,10 +528,16 @@ export const rebuildEntityMentions = (db: DatabaseSync): void => {
       const memoryId = String(row.memory_id || "");
       const content = String(row.content || "");
       if (!memoryId || !content) continue;
-      const role = classifyPersonRole(content);
-      const confidence =
-        role === "relationship" ? 0.92 : role === "public_profile" ? 0.84 : 0.65;
       for (const entity of splitNameCandidates(content)) {
+        const role = classifyMentionRoleForEntity(content, entity);
+        const confidence =
+          role === "relationship"
+            ? 0.92
+            : role === "public_profile"
+              ? 0.84
+              : role === "ops_noise"
+                ? 0.4
+                : 0.65;
         insert.run(
           `${memoryId}|${entity}|lcm_summary`,
           memoryId,

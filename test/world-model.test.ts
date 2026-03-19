@@ -370,6 +370,35 @@ describe("World Model Store", () => {
       expect(personNames).not.toContain("currently");
       expect(personNames).not.toContain("out");
     });
+
+    it("cleans up legacy role-leak entities on rebuild after extractor upgrades", () => {
+      const db = createTestDb();
+      ensureMemoryCurrentForWorldModel(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      db.prepare(`
+        INSERT INTO summaries (summary_id, content, created_at)
+        VALUES (?, ?, ?)
+      `).run(
+        "sum_role_leak_cleanup",
+        "My girlfriend Sarah confirmed the plan. Codex fixed the tests afterwards.",
+        new Date().toISOString(),
+      );
+
+      rebuildWorldModel({ db });
+
+      const personNames = listEntities(db, { includeHidden: true })
+        .filter((entity) => entity.kind === "person")
+        .map((entity) => String(entity.display_name || "").toLowerCase());
+
+      expect(personNames).toContain("sarah");
+      expect(personNames).not.toContain("codex");
+    });
   });
 });
 

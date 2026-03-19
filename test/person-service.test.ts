@@ -298,6 +298,35 @@ describe("Person Store Management", () => {
       expect(keys).not.toContain("out");
       expect(keys).not.toContain("current");
     });
+
+    it("does not leak relationship role across unrelated capitalized tokens in the same summary", () => {
+      const db = createTestDb();
+      ensurePersonStore(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
+      ).run(
+        "sum-role-leak",
+        "My girlfriend Sarah confirmed the plan. Codex fixed the tests afterwards.",
+      );
+
+      rebuildEntityMentions(db);
+
+      const rows = db
+        .prepare(
+          "SELECT entity_key, role FROM entity_mentions ORDER BY entity_key ASC",
+        )
+        .all() as Array<{ entity_key: string; role: string }>;
+      const byKey = new Map(rows.map((row) => [row.entity_key, row.role]));
+
+      expect(byKey.get("sarah")).toBe("relationship");
+      expect(byKey.has("codex")).toBe(false);
+    });
   });
 });
 

@@ -62,6 +62,30 @@ const PERSON_ALIAS_NOISE_TOKENS = new Set([
   "active",
   "always",
   "broken",
+  "build",
+  "built",
+  "call",
+  "change",
+  "changes",
+  "check",
+  "checks",
+  "cleanup",
+  "command",
+  "commands",
+  "commit",
+  "config",
+  "configs",
+  "context",
+  "conversation",
+  "current",
+  "currently",
+  "data",
+  "default",
+  "delete",
+  "deploy",
+  "deployment",
+  "detail",
+  "details",
   "current",
   "currently",
   "default",
@@ -71,20 +95,102 @@ const PERSON_ALIAS_NOISE_TOKENS = new Set([
   "error",
   "errors",
   "fixed",
+  "flow",
+  "follow",
+  "grant",
+  "grants",
+  "graph",
+  "group",
+  "hand",
   "healthy",
   "inactive",
+  "index",
   "issue",
   "issues",
+  "item",
+  "items",
+  "job",
+  "jobs",
   "latest",
+  "layer",
+  "line",
+  "lines",
+  "link",
+  "links",
+  "load",
+  "log",
+  "logs",
+  "memory",
+  "merge",
+  "message",
+  "messages",
+  "mode",
+  "model",
+  "models",
+  "note",
+  "notes",
+  "ops",
   "out",
+  "output",
+  "path",
+  "paths",
+  "pattern",
+  "patterns",
+  "phase",
+  "plan",
+  "plugin",
+  "plugins",
+  "query",
+  "queries",
+  "record",
+  "records",
+  "repo",
+  "report",
+  "result",
+  "results",
   "recent",
+  "review",
+  "run",
+  "scope",
   "search",
+  "session",
+  "setup",
+  "sha",
+  "slot",
+  "slots",
+  "state",
+  "status",
+  "step",
+  "steps",
   "store",
   "stored",
   "stores",
+  "summary",
+  "sync",
+  "system",
+  "task",
+  "tasks",
+  "test",
+  "tests",
+  "timestamp",
   "tool",
   "tools",
+  "topic",
+  "trace",
+  "update",
+  "updates",
+  "url",
+  "urls",
+  "user",
+  "users",
+  "value",
+  "values",
+  "vector",
+  "vectors",
+  "vault",
+  "version",
   "working",
+  "world",
 ]);
 const RELATIONSHIP_LABEL_RE = /\b(partner(?:in)?|wife|husband|girlfriend|boyfriend|freund(?:in)?)\b/i;
 const PREFERENCE_POSITIVE_RE = /\b(?:prefer(?:s)?|like(?:s)?|love(?:s)?)\b/i;
@@ -120,6 +226,7 @@ const FLINT_RESPONSE_RE = /\b(?:flint(?:'s|'s)? name is mentioned|flint response
 const CURRENT_STATE_ALLOWED_TOPICS = new Set(["relationship", "location", "role", "preference", "project", "health"]);
 const STABLE_IDENTITY_SUBTOPICS = new Set(["preferred_name", "communication_style", "visual_identity"]);
 const DURABLE_PROJECT_SUBTOPICS = new Set(["investment_relation", "interview_status", "response_behavior", "food_image_comparison"]);
+const ENTITY_EXTRACTION_SCHEMA_VERSION = "2026-03-19-entity-quality-v2";
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -1003,7 +1110,36 @@ export const ensureWorldModelStore = (db: DatabaseSync): void => {
     );
     CREATE INDEX IF NOT EXISTS idx_entity_links_entity ON entity_links(entity_id, record_type, updated_at);
     CREATE INDEX IF NOT EXISTS idx_entity_links_record ON entity_links(record_type, record_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS entity_runtime_state (
+      state_key TEXT PRIMARY KEY,
+      state_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
+};
+
+const getEntityRuntimeState = (db: DatabaseSync, key: string): string => {
+  ensureWorldModelStore(db);
+  const row = db.prepare(`
+    SELECT state_value
+    FROM entity_runtime_state
+    WHERE state_key = ?
+    LIMIT 1
+  `).get(key) as Record<string, unknown> | undefined;
+  return String(row?.state_value || "").trim();
+};
+
+const setEntityRuntimeState = (db: DatabaseSync, key: string, value: string, now = new Date().toISOString()): void => {
+  ensureWorldModelStore(db);
+  db.prepare(`
+    INSERT INTO entity_runtime_state (
+      state_key, state_value, updated_at
+    ) VALUES (?, ?, ?)
+    ON CONFLICT(state_key) DO UPDATE SET
+      state_value = excluded.state_value,
+      updated_at = excluded.updated_at
+  `).run(key, value, now);
 };
 
 const clearWorldModelStore = (db: DatabaseSync): void => {
@@ -1213,9 +1349,16 @@ export const ensureWorldModelReady = ({ db, config = {} as Record<string, unknow
   latestSourceUpdatedAt = [summaryUpdatedAt, memoryUpdatedAt]
     .filter(Boolean)
     .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || "";
+  const extractorVersion = getEntityRuntimeState(db, "entity_extraction_schema_version");
   const latestSynthesisGeneratedAt = String((db.prepare("SELECT COALESCE(MAX(generated_at), '') AS generated_at FROM entity_syntheses").get() as Record<string, string> | undefined)?.generated_at || "").trim();
   const projectedRows = Number((db.prepare(`SELECT ((SELECT COUNT(*) FROM entities) + (SELECT COUNT(*) FROM entity_beliefs) + (SELECT COUNT(*) FROM entity_episodes) + (SELECT COUNT(*) FROM entity_open_loops) + (SELECT COUNT(*) FROM entity_syntheses)) AS c`).get() as Record<string, number> | undefined)?.c || 0);
-  const needsRefresh = Boolean(activeCount > 0 && latestSourceUpdatedAt && (!latestSynthesisGeneratedAt || Date.parse(latestSourceUpdatedAt) > Date.parse(latestSynthesisGeneratedAt)));
+  const needsRefresh = Boolean(
+    extractorVersion !== ENTITY_EXTRACTION_SCHEMA_VERSION ||
+    (activeCount > 0 &&
+      latestSourceUpdatedAt &&
+      (!latestSynthesisGeneratedAt ||
+        Date.parse(latestSourceUpdatedAt) > Date.parse(latestSynthesisGeneratedAt))),
+  );
   if (activeCount === 0) {
     if (projectedRows > 0) { clearWorldModelStore(db); return { ok: true, rebuilt: true, cleared: true, counts: { entities: 0, aliases: 0, beliefs: 0, episodes: 0, open_loops: 0, contradictions: 0, syntheses: 0 } }; }
     return { rebuilt: false, counts: { entities: 0 } };
@@ -1760,6 +1903,7 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
     db.exec("COMMIT");
   } catch (err) { db.exec("ROLLBACK"); throw err; }
   const linkStats = rebuildEntityLinks(db, now);
+  setEntityRuntimeState(db, "entity_extraction_schema_version", ENTITY_EXTRACTION_SCHEMA_VERSION, now);
   return { ok: true, rebuilt: true, counts: { claims: claimRows.length, entities: mergedRows.entityRows.length, aliases: mergedRows.aliasRows.length, beliefs: mergedRows.beliefRows.length, episodes: mergedRows.episodeRows.length, open_loops: mergedRows.openLoopRows.length, contradictions: contradictions.length, syntheses: mergedRows.synthesisRows.length, links: linkStats.linkCount } };
 };
 
