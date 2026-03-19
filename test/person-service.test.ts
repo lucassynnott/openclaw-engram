@@ -268,6 +268,36 @@ describe("Person Store Management", () => {
       expect(keys).not.toContain("tools");
       expect(keys).not.toContain("don");
     });
+
+    it("rejects common English command/state words as entity candidates", () => {
+      const db = createTestDb();
+      ensurePersonStore(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
+      ).run(
+        "sum-noise-2",
+        "Store the vectors now. Currently the gateway is healthy. Out of caution, Lucas will verify backups.",
+      );
+
+      rebuildEntityMentions(db);
+
+      const rows = db
+        .prepare("SELECT entity_key FROM entity_mentions ORDER BY entity_key ASC")
+        .all() as Array<{ entity_key: string }>;
+      const keys = rows.map((row) => row.entity_key);
+
+      expect(keys).toContain("lucas");
+      expect(keys).not.toContain("store");
+      expect(keys).not.toContain("currently");
+      expect(keys).not.toContain("out");
+      expect(keys).not.toContain("current");
+    });
   });
 });
 

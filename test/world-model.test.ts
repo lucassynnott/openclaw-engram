@@ -341,6 +341,35 @@ describe("World Model Store", () => {
       expect(after.some((entity) => entity.entity_id === "person:lucas")).toBe(true);
       expect(after.some((entity) => entity.entity_id === "person:lukas")).toBe(false);
     });
+
+    it("does not promote common English noise tokens into person entities", () => {
+      const db = createTestDb();
+      ensureMemoryCurrentForWorldModel(db);
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO memory_current (
+          memory_id, content, status, type, confidence, scope, source_layer, updated_at, created_at, tags
+        ) VALUES (?, ?, 'active', 'USER_FACT', 0.86, 'shared', 'registry', ?, ?, ?)
+      `).run(
+        "mem_noise_words",
+        "Lucas is handling the rollout. Store the vectors now. Currently the gateway is healthy. Out of caution, verify backups.",
+        now,
+        now,
+        JSON.stringify(["Lucas", "store", "current", "out"]),
+      );
+
+      rebuildWorldModel({ db });
+
+      const personNames = listEntities(db, { includeHidden: true })
+        .filter((entity) => entity.kind === "person")
+        .map((entity) => String(entity.display_name || "").toLowerCase());
+
+      expect(personNames).toContain("lucas");
+      expect(personNames).not.toContain("store");
+      expect(personNames).not.toContain("current");
+      expect(personNames).not.toContain("currently");
+      expect(personNames).not.toContain("out");
+    });
   });
 });
 

@@ -30,6 +30,34 @@ const ENTITY_QUERY_HINT_TAIL_RE =
   /\b(?:wer ist|wer war|who is|who was|about|über|ueber|tell me about|was weißt du über|was weisst du über)\s+(.+)$/i;
 const WELL_KNOWN_NAMES_RE = /(?!x)x/gi; // configurable — no hardcoded names
 const PROPER_NAME_RE = /\b[A-ZÄÖÜ][a-zäöüß][A-Za-zÄÖÜäöüß0-9-]{1,}\b/g;
+const COMMON_NON_PERSON_TOKENS = new Set([
+  "active",
+  "always",
+  "broken",
+  "current",
+  "currently",
+  "default",
+  "disabled",
+  "don",
+  "enabled",
+  "error",
+  "errors",
+  "fixed",
+  "healthy",
+  "inactive",
+  "issue",
+  "issues",
+  "latest",
+  "out",
+  "recent",
+  "search",
+  "store",
+  "stored",
+  "stores",
+  "tool",
+  "tools",
+  "working",
+]);
 
 const QUERY_STOPWORDS = new Set([
   "wer", "ist", "war", "was", "wie", "wo", "wann", "warum", "wieso", "ueber",
@@ -47,7 +75,7 @@ const QUERY_STOPWORDS = new Set([
   "while", "since", "until", "into", "only", "very", "more", "most",
   "noch", "auch", "aber", "denn", "weil", "wenn", "dann", "hier",
   "dort", "schon", "jetzt", "immer", "alles", "mein", "dein", "sein",
-  "always", "search", "tool", "tools", "don",
+  ...COMMON_NON_PERSON_TOKENS,
 ]);
 
 const ENTITY_NOISE_STOPWORDS = new Set([
@@ -62,7 +90,7 @@ const ENTITY_NOISE_STOPWORDS = new Set([
   "neobank", "original", "poly", "prozess", "refresh", "restart", "send", "setup", "soft",
   "studio", "thoughtful", "token", "topic", "uhr", "user", "verify", "vienna", "wichtige",
   "wien", "wrong", "zumsteinplatz", "archive", "contact", "content", "date",
-  "warm", "always", "search", "tool", "tools", "don",
+  "warm", ...COMMON_NON_PERSON_TOKENS,
   "january", "february", "march", "april", "may", "june", "july", "august",
   "september", "october", "november", "december", "jan", "feb", "mar", "apr",
   "jun", "jul", "aug", "sep", "oct", "nov", "dec", "today", "heute",
@@ -117,6 +145,7 @@ const isLikelyStandaloneNameCandidate = (
   normalized: string,
 ): boolean => {
   if (!normalized || ENTITY_NOISE_STOPWORDS.has(normalized)) return false;
+  if (COMMON_NON_PERSON_TOKENS.has(normalized)) return false;
   if (PLACEISH_TOKEN_RE.test(original) || PLACEISH_TOKEN_RE.test(normalized)) return false;
   if (TECHISH_TOKEN_RE.test(normalized)) return false;
   if (!/^[a-zäöüß][a-zäöüß''.-]{2,47}$/i.test(original)) return false;
@@ -164,6 +193,7 @@ const isLikelyEntityToken = (value: unknown): boolean => {
   if (!token) return false;
   if (token.length < 3 || token.length > 48) return false;
   if (/^\d+$/.test(token)) return false;
+  if (COMMON_NON_PERSON_TOKENS.has(token)) return false;
   if (QUERY_STOPWORDS.has(token)) return false;
   if (ENTITY_NOISE_STOPWORDS.has(token)) return false;
   return true;

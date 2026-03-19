@@ -58,6 +58,34 @@ const ENTITY_ALIAS_STOPWORDS = new Set([
   "september", "october", "november", "december", "jan", "feb", "mar", "apr",
   "jun", "jul", "aug", "sep", "oct", "nov", "dec", "today", "heute",
 ]);
+const PERSON_ALIAS_NOISE_TOKENS = new Set([
+  "active",
+  "always",
+  "broken",
+  "current",
+  "currently",
+  "default",
+  "disabled",
+  "don",
+  "enabled",
+  "error",
+  "errors",
+  "fixed",
+  "healthy",
+  "inactive",
+  "issue",
+  "issues",
+  "latest",
+  "out",
+  "recent",
+  "search",
+  "store",
+  "stored",
+  "stores",
+  "tool",
+  "tools",
+  "working",
+]);
 const RELATIONSHIP_LABEL_RE = /\b(partner(?:in)?|wife|husband|girlfriend|boyfriend|freund(?:in)?)\b/i;
 const PREFERENCE_POSITIVE_RE = /\b(?:prefer(?:s)?|like(?:s)?|love(?:s)?)\b/i;
 const PREFERENCE_NEGATIVE_RE = /\b(?:hate(?:s)?|dislike(?:s)?)\b/i;
@@ -148,6 +176,7 @@ const PLACEISH_ALIAS_RE = /(?:platz|strasse|straße|gasse|weg|allee|street|road)
 const isLikelyPersonAlias = (value = ""): boolean => {
   const normalized = normalizeContent(value);
   if (!normalized || isGenericAlias(normalized)) return false;
+  if (PERSON_ALIAS_NOISE_TOKENS.has(normalized)) return false;
   if (!PERSONISH_ALIAS_RE.test(normalized)) return false;
   if (PLACEISH_ALIAS_RE.test(normalized)) return false;
   return true;
