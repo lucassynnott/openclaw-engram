@@ -237,6 +237,37 @@ describe("Person Store Management", () => {
       ensurePersonStore(db);
       expect(() => rebuildEntityMentions(db)).not.toThrow();
     });
+
+    it("filters sentence-start noise tokens while keeping real names", () => {
+      const db = createTestDb();
+      ensurePersonStore(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
+      ).run(
+        "sum-noise-1",
+        "Always ask Sarah before you search tools. Don't page Lucas unless the migration is blocked.",
+      );
+
+      rebuildEntityMentions(db);
+
+      const rows = db
+        .prepare("SELECT entity_key FROM entity_mentions ORDER BY entity_key ASC")
+        .all() as Array<{ entity_key: string }>;
+      const keys = rows.map((row) => row.entity_key);
+
+      expect(keys).toContain("sarah");
+      expect(keys).toContain("lucas");
+      expect(keys).not.toContain("always");
+      expect(keys).not.toContain("search");
+      expect(keys).not.toContain("tools");
+      expect(keys).not.toContain("don");
+    });
   });
 });
 

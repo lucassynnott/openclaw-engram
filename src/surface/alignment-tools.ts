@@ -62,6 +62,7 @@ const RISK_RULES: Array<{
       /\bdrop\s+database\b/i,
       /\btruncate\s+table\b/i,
       /\bdelete\s+(all|the)\s+(data|records|history|files)\b/i,
+      /\bdelete\s+(?:all|the)\s+(?:[\w-]+\s+){0,2}(?:data|records|history|files)\b/i,
       /\bwipe\b.*\b(data|disk|history|database)\b/i,
       /\bpurge\b.*\b(data|records|history)\b/i,
     ],
@@ -119,6 +120,11 @@ const RISK_RULES: Array<{
     ],
   },
 ];
+
+const NEGATED_MITIGATION_PREFIX_RE =
+  /\b(?:without|no|not|never|skip|skipping|avoid|avoiding|omit|omitting|lacking|lack(?:ing)?|missing|refus(?:e|ing)|don['’]t|do not|didn['’]t|did not|won['’]t|will not|cannot|can't)\b[\s:-]{0,32}$/i;
+const NEGATED_MITIGATION_CONTEXT_RE =
+  /\b(?:without|no|not|never|skip|skipping|avoid|avoiding|omit|omitting|lacking|lack(?:ing)?|missing|don['’]t|do not|didn['’]t|did not|won['’]t|will not|cannot|can't)\b/i;
 
 const SAFETY_RULES: Array<{
   code: string;
@@ -193,6 +199,26 @@ function isObserveOnly(config: LcmConfig): boolean {
   return config.gradientObserveOnly !== false;
 }
 
+function buildGlobalPattern(pattern: RegExp): RegExp {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  return new RegExp(pattern.source, flags);
+}
+
+function isNegatedMitigation(text: string, index: number): boolean {
+  const prefix = text.slice(Math.max(0, index - 48), index);
+  if (NEGATED_MITIGATION_PREFIX_RE.test(prefix)) {
+    return true;
+  }
+  const sentenceStart = Math.max(
+    prefix.lastIndexOf("."),
+    prefix.lastIndexOf("!"),
+    prefix.lastIndexOf("?"),
+    prefix.lastIndexOf("\n"),
+  );
+  const localContext = prefix.slice(sentenceStart >= 0 ? sentenceStart + 1 : 0);
+  return NEGATED_MITIGATION_CONTEXT_RE.test(localContext);
+}
+
 function extractSignals(text: string, context?: string): AlignmentSignal[] {
   const combined = `${text}\n${context || ""}`.trim();
   const signals: AlignmentSignal[] = [];
@@ -213,15 +239,21 @@ function extractSignals(text: string, context?: string): AlignmentSignal[] {
   }
   for (const rule of SAFETY_RULES) {
     for (const pattern of rule.patterns) {
-      const match = combined.match(pattern);
-      if (!match) continue;
+      let selectedMatch: RegExpExecArray | null = null;
+      for (const candidate of combined.matchAll(buildGlobalPattern(pattern))) {
+        const matchIndex = typeof candidate.index === "number" ? candidate.index : 0;
+        if (isNegatedMitigation(combined, matchIndex)) continue;
+        selectedMatch = candidate;
+        break;
+      }
+      if (!selectedMatch) continue;
       signals.push({
         code: rule.code,
         category: rule.category,
         severity: "low",
         effect: rule.effect,
         message: rule.message,
-        matched: match[0],
+        matched: selectedMatch[0],
       });
       break;
     }

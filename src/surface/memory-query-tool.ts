@@ -87,6 +87,90 @@ function pickStrategy(query: string, configuredDefault: string): string {
   return "quick_context";
 }
 
+function truncateInlineText(value: unknown, maxChars: number): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+function limitRecordCollection(
+  items: unknown,
+  limit: number,
+  stringFieldLimits: Record<string, number>,
+): { items: Array<Record<string, unknown>>; total: number; truncated: boolean } {
+  const rows = Array.isArray(items)
+    ? items.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
+  const limited = rows.slice(0, limit).map((row) => {
+    const next: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (typeof value === "string") {
+        next[key] = truncateInlineText(value, stringFieldLimits[key] ?? 320);
+      } else {
+        next[key] = value;
+      }
+    }
+    return next;
+  });
+  return {
+    items: limited,
+    total: rows.length,
+    truncated: rows.length > limited.length,
+  };
+}
+
+function buildEntityBriefPayload(detail: Record<string, unknown>): Record<string, unknown> {
+  const beliefs = limitRecordCollection(detail.beliefs, 8, {
+    content: 220,
+    evidence: 220,
+  });
+  const episodes = limitRecordCollection(detail.episodes, 6, {
+    title: 120,
+    summary: 220,
+  });
+  const openLoops = limitRecordCollection(detail.open_loops, 6, {
+    content: 180,
+  });
+  const syntheses = limitRecordCollection(detail.syntheses, 4, {
+    content: 260,
+    title: 120,
+  });
+  const links = limitRecordCollection(detail.links, 12, {
+    relation: 80,
+    target_display_name: 120,
+  });
+
+  return {
+    entity_id: detail.entity_id,
+    display_name: detail.display_name,
+    normalized_name: detail.normalized_name,
+    kind: detail.kind,
+    status: detail.status,
+    confidence: detail.confidence,
+    aliases: Array.isArray(detail.aliases) ? (detail.aliases as unknown[]).slice(0, 12) : [],
+    payload: detail.payload,
+    beliefs: beliefs.items,
+    episodes: episodes.items,
+    open_loops: openLoops.items,
+    syntheses: syntheses.items,
+    links: links.items,
+    counts: {
+      beliefs: beliefs.total,
+      episodes: episodes.total,
+      open_loops: openLoops.total,
+      syntheses: syntheses.total,
+      links: links.total,
+    },
+    truncated:
+      beliefs.truncated ||
+      episodes.truncated ||
+      openLoops.truncated ||
+      syntheses.truncated ||
+      links.truncated,
+  };
+}
+
 function buildEntityBrief(db: DatabaseSync, query: string, entityId?: string): {
   result: string;
   confidence: number;
@@ -118,6 +202,7 @@ function buildEntityBrief(db: DatabaseSync, query: string, entityId?: string): {
   const beliefs = Array.isArray(detail.beliefs) ? detail.beliefs.slice(0, 5) as Array<Record<string, unknown>> : [];
   const episodes = Array.isArray(detail.episodes) ? detail.episodes.slice(0, 4) as Array<Record<string, unknown>> : [];
   const syntheses = Array.isArray(detail.syntheses) ? detail.syntheses as Array<Record<string, unknown>> : [];
+  const entityBriefPayload = buildEntityBriefPayload(detail);
   const brief =
     syntheses.find((item) => typeof item.kind === "string" && String(item.kind).includes("brief"))?.content
     || [
@@ -137,7 +222,7 @@ function buildEntityBrief(db: DatabaseSync, query: string, entityId?: string): {
       ...beliefs.map((belief) => String(belief.belief_id || "")).filter(Boolean),
       ...episodes.map((episode) => String(episode.episode_id || "")).filter(Boolean),
     ],
-    entity: detail,
+    entity: entityBriefPayload,
   };
 }
 

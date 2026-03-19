@@ -283,6 +283,32 @@ describe("Engram v2 Core Tools Integration Test", () => {
       expect(result.details.count).toBeGreaterThan(0);
     });
 
+    it("caps entity_brief payload size while preserving summary text", async () => {
+      const addTool = createMemoryAddTool({ config });
+      const queryTool = createMemoryQueryTool({ config });
+
+      for (let index = 0; index < 14; index += 1) {
+        await addTool.execute(`brief-${index}`, {
+          content: `Engram belief ${index}: detailed rollout note ${"x".repeat(180)}.`,
+          kind: "USER_FACT",
+          entities: ["Engram"],
+          dedupeMode: "none",
+        });
+      }
+
+      const result = await queryTool.execute("t17b", {
+        query: "What do we know about Engram?",
+        strategy: "entity_brief",
+      });
+
+      expect(result.details.strategy).toBe("entity_brief");
+      expect(result.details.result).toContain("Engram");
+      expect(result.details.entity.display_name).toBe("Engram");
+      expect(result.details.entity.counts.beliefs).toBeGreaterThan(8);
+      expect(result.details.entity.beliefs.length).toBeLessThanOrEqual(8);
+      expect(result.details.entity.truncated).toBe(true);
+    });
+
     it("returns error for invalid date formats", async () => {
       const queryTool = createMemoryQueryTool({ config });
 

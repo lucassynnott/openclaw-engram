@@ -47,6 +47,7 @@ const QUERY_STOPWORDS = new Set([
   "while", "since", "until", "into", "only", "very", "more", "most",
   "noch", "auch", "aber", "denn", "weil", "wenn", "dann", "hier",
   "dort", "schon", "jetzt", "immer", "alles", "mein", "dein", "sein",
+  "always", "search", "tool", "tools", "don",
 ]);
 
 const ENTITY_NOISE_STOPWORDS = new Set([
@@ -61,7 +62,7 @@ const ENTITY_NOISE_STOPWORDS = new Set([
   "neobank", "original", "poly", "prozess", "refresh", "restart", "send", "setup", "soft",
   "studio", "thoughtful", "token", "topic", "uhr", "user", "verify", "vienna", "wichtige",
   "wien", "wrong", "zumsteinplatz", "archive", "contact", "content", "date",
-  "warm",
+  "warm", "always", "search", "tool", "tools", "don",
   "january", "february", "march", "april", "may", "june", "july", "august",
   "september", "october", "november", "december", "jan", "feb", "mar", "apr",
   "jun", "jul", "aug", "sep", "oct", "nov", "dec", "today", "heute",

@@ -6,10 +6,13 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "./src/db/config.js";
 import { getLcmConnection } from "./src/db/connection.js";
 import { LcmContextEngine } from "./src/context/engine.js";
+import {
+  registerContextEngine,
+  type OpenClawPluginApi,
+} from "./src/integration/openclaw-bridge.js";
 import {
   createAlignmentCheckTool,
   createAlignmentDriftTool,
@@ -945,7 +948,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         let effectiveRuntimeConfig = runtimeConfig;
         if (!isRecord(effectiveRuntimeConfig)) {
           try {
-            effectiveRuntimeConfig = api.runtime.config.loadConfig();
+            effectiveRuntimeConfig = api.runtime.config?.loadConfig?.();
           } catch {
             // loadConfig may not be available in all contexts; leave undefined.
           }
@@ -1322,10 +1325,18 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
 
       try {
-        const cfg = api.runtime.config.loadConfig();
+        const cfg = api.runtime.config?.loadConfig?.();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+        const storeName =
+          isRecord(cfg) && isRecord(cfg.session) && typeof cfg.session.store === "string"
+            ? cfg.session.store
+            : undefined;
+        const resolveStorePath = api.runtime.channel?.session?.resolveStorePath;
+        if (typeof resolveStorePath !== "function") {
+          return undefined;
+        }
+        const storePath = resolveStorePath(storeName, {
           agentId,
         });
         const raw = readFileSync(storePath, "utf8");
@@ -1467,12 +1478,8 @@ const lcmPlugin = {
     ensureMemoryVectorTables(db, deps.config);
     const lcm = new LcmContextEngine(deps);
 
-    // registerContextEngine may not be available in all OpenClaw versions
-    const registerCE = (api as Record<string, unknown>).registerContextEngine;
     const engineId = typeof api.id === "string" && api.id.trim() ? api.id.trim() : "engram";
-    if (typeof registerCE === "function") {
-      (registerCE as (...args: unknown[]) => void).call(api, engineId, () => lcm);
-    }
+    registerContextEngine(api, engineId, () => lcm);
 
     // Register web-console HTTP routes at /memory/*
     const gatewayToken = String(

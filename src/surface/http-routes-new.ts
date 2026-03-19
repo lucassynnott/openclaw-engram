@@ -2,9 +2,12 @@
 
 import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { getLcmConnection, closeLcmConnection } from "../db/connection.js";
 import { getLcmDbFeatures } from "../db/features.js";
+import type {
+  OpenClawHttpRouteRegistration,
+  OpenClawPluginApi,
+} from "../integration/openclaw-bridge.js";
 import { ConversationStore } from "../memory/store/conversation-store.js";
 import { SummaryStore } from "../memory/store/summary-store.js";
 import type { LcmConfig } from "../db/config.js";
@@ -46,7 +49,7 @@ export type RegisterLcmHttpRoutesOptions = {
   gatewayToken?: string;
 };
 
-type HttpRouteRegistration = Parameters<OpenClawPluginApi["registerHttpRoute"]>[0] & {
+type HttpRouteRegistration = OpenClawHttpRouteRegistration & {
   auth?: string;
   match?: string;
 };

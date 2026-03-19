@@ -1,3 +1,6 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { OpenClawPluginApi as SdkOpenClawPluginApi } from "openclaw/plugin-sdk";
+
 /**
  * Compatibility bridge for OpenClaw context-engine symbols.
  *
@@ -111,6 +114,21 @@ export interface ContextEngine {
 }
 
 export type ContextEngineFactory = () => ContextEngine;
+
+export type OpenClawHttpRouteRegistration = {
+  path: string;
+  auth?: string;
+  match?: string;
+  replaceExisting?: boolean;
+  handler: (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ) => void | Promise<void>;
+};
+
+export type OpenClawPluginApi = SdkOpenClawPluginApi & {
+  registerContextEngine?: (id: string, factory: ContextEngineFactory) => void;
+};
 
 export function registerContextEngine(
   api: { registerContextEngine?: unknown },

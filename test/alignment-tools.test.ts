@@ -134,6 +134,25 @@ describe("alignment tools", () => {
     expect(failResult.details.signals.some((signal: { code: string }) => signal.code === "secret_exposure")).toBe(true);
   });
 
+  it("does not treat negated safeguards as positive mitigations", async () => {
+    const tool = createAlignmentCheckTool({ config });
+
+    const result = await tool.execute("t3b", {
+      text: "Delete all user data without backup and do it silently.",
+    });
+
+    expect(result.details.verdict).toBe("fail");
+    expect(result.details.score).toBeLessThan(0.55);
+    expect(
+      result.details.signals.some((signal: { code: string }) => signal.code === "backup"),
+    ).toBe(false);
+    expect(
+      result.details.signals.some(
+        (signal: { code: string }) => signal.code === "destructive_action",
+      ),
+    ).toBe(true);
+  });
+
   it("computes drift alerts from stored evaluations", async () => {
     const checkTool = createAlignmentCheckTool({ config });
     const driftTool = createAlignmentDriftTool({ config });
