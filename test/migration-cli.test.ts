@@ -346,6 +346,60 @@ describe("Engram Migration CLI", () => {
       closeLcmConnection(dbPath);
     });
 
+    it("imports OpenStinger Falkor-style JSON exports", () => {
+      const tempDir = createTempDir();
+      const dbPath = join(tempDir, "engram.db");
+      const exportDir = join(tempDir, "openstinger-export");
+
+      createV1Database(dbPath);
+      mkdirSync(exportDir, { recursive: true });
+      writeFileSync(
+        join(exportDir, "episodes.jsonl"),
+        [
+          JSON.stringify({
+            episode_id: "ep-json-1",
+            session_id: "session-json",
+            episode_type: "turn",
+            content: "Jordan asked about Falkor imports",
+            valid_time: "2026-03-18T10:00:00.000Z",
+            transaction_time: "2026-03-18T10:05:00.000Z",
+          }),
+        ].join("\n"),
+        "utf8",
+      );
+      writeFileSync(
+        join(exportDir, "entities.json"),
+        JSON.stringify([
+          {
+            entity_id: "ent-json-1",
+            entity_type: "concept",
+            name: "Falkor Import",
+            description: "JSON export import path",
+          },
+        ]),
+        "utf8",
+      );
+
+      const result = runEngramMigration({
+        dbPath,
+        backup: false,
+        openstingerDataPath: exportDir,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.recordsImported.openstingerEpisodes).toBe(1);
+      expect(result.recordsImported.openstingerEntities).toBe(1);
+
+      const db = getLcmConnection(dbPath);
+      expect(
+        db.prepare("SELECT COUNT(*) AS count FROM openstinger_episodes WHERE episode_id = 'ep-json-1'").get(),
+      ).toEqual({ count: 1 });
+      expect(
+        db.prepare("SELECT COUNT(*) AS count FROM openstinger_entities WHERE entity_id = 'ent-json-1'").get(),
+      ).toEqual({ count: 1 });
+      closeLcmConnection(dbPath);
+    });
+
     it("runs in dry-run mode without applying changes", () => {
       const tempDir = createTempDir();
       const dbPath = join(tempDir, "engram.db");

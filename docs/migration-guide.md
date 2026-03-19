@@ -104,7 +104,7 @@ console.log('Import', rows.length, 'memories via: engram migrate --from gigabrai
 
 **Before:** OpenStinger Python MCP server (`openstinger serve`)
 
-**After:** `openclaw plugins install engram` (no Python, no FalkorDB)
+**After:** `openclaw plugins install engram` (no Python; optional FalkorDB vector mirror)
 
 ### What changed
 
@@ -112,21 +112,21 @@ console.log('Import', rows.length, 'memories via: engram migrate --from gigabrai
 |-----------------|----------------|-------|
 | `memory_add` | `memory_add` | Same semantics, SQLite backend |
 | `memory_query` | `memory_query` | Adds `afterDate`/`beforeDate` params |
-| `memory_search` | `memory_search` | FTS5 + LIKE fallback (no vector yet) |
+| `memory_search` | `memory_search` | Hybrid lexical + vector recall with native `sqlite-vec`, provider embeddings, and optional FalkorDB neighbors |
 | `memory_get_entity` | `memory_get_entity` | SQLite-backed |
 | `memory_get_episode` | `memory_get_episode` | SQLite-backed |
 | `memory_namespace_status` | `memory_namespace_status` | Available |
-| `memory_list_agents` | `memory_list_agents` | P3 stub |
-| `memory_ingest_now` | `memory_ingest_now` | P3 stub |
-| `memory_job_status` | `memory_job_status` | P3 stub |
-| `gradient_status` | `alignment_status` | P3 stub |
-| `gradient_alignment_score` | `alignment_check` | P3 stub |
-| `gradient_drift_status` | `alignment_drift` | P3 stub |
+| `memory_list_agents` | `memory_list_agents` | SQLite-backed namespace discovery |
+| `memory_ingest_now` | `memory_ingest_now` | SQLite-backed background ingestion jobs |
+| `memory_job_status` | `memory_job_status` | SQLite-backed durable job status |
+| `gradient_status` | `alignment_status` | Local heuristic evaluator status + drift summary |
+| `gradient_alignment_score` | `alignment_check` | Local heuristic evaluator with persisted scoring |
+| `gradient_drift_status` | `alignment_drift` | Rolling drift statistics over stored evaluations |
 | `vault_*` (6 tools) | **Not exposed** | Vault managed internally |
 
 ### Data migration
 
-OpenStinger used FalkorDB (Postgres-backed). Engram v2 uses SQLite.
+OpenStinger used FalkorDB (Postgres-backed). Engram v2 uses SQLite as the primary store and can optionally mirror/query vectors through FalkorDB.
 
 ```bash
 # Export OpenStinger episodes to JSONL
@@ -138,9 +138,12 @@ engram migrate --from openstinger --input /tmp/os-episodes.jsonl
 
 ### Removed dependencies
 
-- FalkorDB / Redis — not needed
 - PostgreSQL — not needed
 - Python runtime — not needed (Engram v2 is Node.js)
+
+Optional components:
+
+- FalkorDB / Redis — only needed if you enable the external vector backend
 
 ---
 
@@ -211,8 +214,8 @@ import { generateEngramSystemPrompt } from "engram/tools";
 const systemPrompt = generateEngramSystemPrompt({
   lcmEnabled: true,
   memoryEnabled: true,
-  episodicEnabled: false,  // set true when P3 ships
-  alignmentEnabled: false, // set true when P3 ships
+  episodicEnabled: true,
+  alignmentEnabled: true,
 });
 ```
 
@@ -229,12 +232,9 @@ const systemPrompt = generateEngramSystemPrompt({
 
 ## What is NOT yet available in v2
 
-These features are planned for P3/P4:
+Remaining planned upgrades:
 
-- Background ingestion scheduler (`memory_ingest_now`, `memory_job_status`)
-- Multi-agent namespace isolation (`memory_list_agents`)
-- Gradient alignment evaluation (`alignment_check`, `alignment_status`, `alignment_drift`)
-- Vector similarity search (currently uses FTS5 + LIKE fallback)
-- sqlite-vec embeddings for semantic search
+- Provider-specific embedding adapters beyond the OpenAI-compatible surface
+- More migration helpers for legacy graph exports
 
-When these features ship, the stubs will activate automatically — no prompt changes needed.
+Background ingestion, namespace discovery, local alignment evaluation, native `sqlite-vec`, provider-backed embeddings, and the optional FalkorDB vector backend are active locally; no prompt changes are needed to use them.

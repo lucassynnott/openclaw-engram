@@ -2,27 +2,21 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
+import {
+  DEFAULT_MEMORY_NAMESPACE,
+  normalizeMemoryNamespace,
+  resolveMemoryNamespaceFromSessionContext,
+} from "../memory/agent-namespace.js";
+import { ensureMemoryTables } from "../memory/memory-schema.js";
+import {
+  enqueueEpisodicIngestionJob,
+  getEpisodicIngestionJob,
+  getEpisodicIngestionQueueSummary,
+  kickEpisodicIngestionScheduler,
+} from "../memory/episodic-jobs.js";
+import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-
-/**
- * Episodic/temporal memory tools.
- *
- * These tools map to OpenStinger Tier 1 tools (memory_get_entity,
- * memory_get_episode, memory_ingest_now, memory_namespace_status,
- * memory_list_agents, memory_job_status) but are implemented over
- * the unified SQLite schema instead of FalkorDB.
- *
- * Implementation status:
- * - memory_get_entity: fully implemented (reads memory_entities)
- * - memory_get_episode: fully implemented (reads memory_episodes)
- * - memory_namespace_status: fully implemented (stats query)
- * - memory_list_agents: stub — multi-agent namespacing is a P3 feature
- * - memory_ingest_now: stub — background ingestion scheduler is a P3 feature
- * - memory_job_status: stub — job queue is a P3 feature
- */
-
-// ── memory_get_entity ────────────────────────────────────────────────────────
 
 const GetEntitySchema = Type.Object({
   entityId: Type.String({
@@ -36,8 +30,7 @@ export function createMemoryGetEntityTool(input: { config: LcmConfig }): AnyAgen
     label: "Get Memory Entity",
     description:
       "Fetch a specific entity by UUID from the memory entity registry. " +
-      "Returns entity metadata and associated memories. " +
-      "Get entity IDs from memory_world or memory_search results.",
+      "Returns entity metadata and associated memories.",
     parameters: GetEntitySchema,
     async execute(_toolCallId, params) {
       const p = params as Record<string, unknown>;
@@ -55,23 +48,7 @@ export function createMemoryGetEntityTool(input: { config: LcmConfig }): AnyAgen
           detail: err instanceof Error ? err.message : String(err),
         });
       }
-
-      db.exec(`CREATE TABLE IF NOT EXISTS memory_entities (
-        entity_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'person',
-        display_name TEXT NOT NULL, normalized_name TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active', confidence REAL NOT NULL DEFAULT 0.7,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS memory_current (
-        memory_id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT 'CONTEXT',
-        content TEXT NOT NULL, normalized TEXT NOT NULL DEFAULT '',
-        normalized_hash TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'manual',
-        source_agent TEXT, source_session TEXT, confidence REAL DEFAULT 0.75,
-        scope TEXT NOT NULL DEFAULT 'shared', status TEXT NOT NULL DEFAULT 'active',
-        value_score REAL, value_label TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        archived_at TEXT, last_reviewed_at TEXT, tags TEXT NOT NULL DEFAULT '[]',
-        superseded_by TEXT, content_time TEXT, valid_until TEXT
-      )`);
+      ensureMemoryTables(db);
 
       const entity = db
         .prepare("SELECT * FROM memory_entities WHERE entity_id = ?")
@@ -81,17 +58,15 @@ export function createMemoryGetEntityTool(input: { config: LcmConfig }): AnyAgen
         return jsonResult({ error: `Entity not found: ${entityId}` });
       }
 
-      // Fetch associated memories
       const memories = db
-        .prepare(
-          `SELECT memory_id, type, content, confidence, created_at
-           FROM memory_current
-           WHERE status = 'active' AND (tags LIKE ? OR content LIKE ?)
-           ORDER BY confidence DESC LIMIT 10`,
-        )
-        .all(`%${entity.display_name}%`, `%${entity.display_name}%`) as Array<
-        Record<string, unknown>
-      >;
+        .prepare(`
+          SELECT memory_id, type, content, confidence, created_at
+          FROM memory_current
+          WHERE status = 'active' AND (tags LIKE ? OR content LIKE ?)
+          ORDER BY confidence DESC
+          LIMIT 10
+        `)
+        .all(`%${entity.display_name}%`, `%${entity.display_name}%`) as Array<Record<string, unknown>>;
 
       return jsonResult({
         entity: {
@@ -103,19 +78,17 @@ export function createMemoryGetEntityTool(input: { config: LcmConfig }): AnyAgen
           created_at: entity.created_at,
           updated_at: entity.updated_at,
         },
-        memories: memories.map((m) => ({
-          id: m.memory_id,
-          kind: m.type,
-          content: m.content,
-          confidence: m.confidence,
-          created_at: m.created_at,
+        memories: memories.map((memory) => ({
+          id: memory.memory_id,
+          kind: memory.type,
+          content: memory.content,
+          confidence: memory.confidence,
+          created_at: memory.created_at,
         })),
       });
     },
   };
 }
-
-// ── memory_get_episode ───────────────────────────────────────────────────────
 
 const GetEpisodeSchema = Type.Object({
   episodeId: Type.String({
@@ -129,8 +102,7 @@ export function createMemoryGetEpisodeTool(input: { config: LcmConfig }): AnyAge
     label: "Get Memory Episode",
     description:
       "Fetch a specific episode by UUID from the memory episode store. " +
-      "Episodes are structured summaries of discrete events or decision points. " +
-      "Get episode IDs from memory_search or memory_query results.",
+      "Episodes are structured summaries of discrete events or decision points.",
     parameters: GetEpisodeSchema,
     async execute(_toolCallId, params) {
       const p = params as Record<string, unknown>;
@@ -148,13 +120,7 @@ export function createMemoryGetEpisodeTool(input: { config: LcmConfig }): AnyAge
           detail: err instanceof Error ? err.message : String(err),
         });
       }
-
-      db.exec(`CREATE TABLE IF NOT EXISTS memory_episodes (
-        episode_id TEXT PRIMARY KEY, title TEXT NOT NULL, summary TEXT NOT NULL,
-        start_date TEXT, end_date TEXT, status TEXT NOT NULL DEFAULT 'completed',
-        primary_entity_id TEXT, source_memory_ids TEXT NOT NULL DEFAULT '[]',
-        payload TEXT NOT NULL DEFAULT '{}'
-      )`);
+      ensureMemoryTables(db);
 
       const episode = db
         .prepare("SELECT * FROM memory_episodes WHERE episode_id = ?")
@@ -186,16 +152,12 @@ export function createMemoryGetEpisodeTool(input: { config: LcmConfig }): AnyAge
   };
 }
 
-// ── memory_namespace_status ──────────────────────────────────────────────────
-
 export function createMemoryNamespaceStatusTool(input: { config: LcmConfig }): AnyAgentTool {
   return {
     name: "memory_namespace_status",
     label: "Memory Namespace Status",
     description:
-      "Check memory store health and statistics. " +
-      "Returns counts of active memories, entities, episodes, and events. " +
-      "Use this to verify the memory system is functioning and check capacity.",
+      "Check memory store health and statistics. Returns counts of active memories, entities, episodes, and events.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
       let db: DatabaseSync;
@@ -210,28 +172,17 @@ export function createMemoryNamespaceStatusTool(input: { config: LcmConfig }): A
 
       try {
         const memoriesCount = (
-          db
-            .prepare("SELECT COUNT(*) AS c FROM memory_current WHERE status = 'active'")
-            .get() as Record<string, unknown>
+          db.prepare("SELECT COUNT(*) AS c FROM memory_current WHERE status = 'active'").get() as Record<string, unknown>
         )?.c ?? 0;
         const entitiesCount = (
-          db
-            .prepare("SELECT COUNT(*) AS c FROM memory_entities WHERE status = 'active'")
-            .get() as Record<string, unknown>
+          db.prepare("SELECT COUNT(*) AS c FROM memory_entities WHERE status = 'active'").get() as Record<string, unknown>
         )?.c ?? 0;
         const episodesCount = (
-          db.prepare("SELECT COUNT(*) AS c FROM memory_episodes").get() as Record<
-            string,
-            unknown
-          >
+          db.prepare("SELECT COUNT(*) AS c FROM memory_episodes").get() as Record<string, unknown>
         )?.c ?? 0;
         const eventsCount = (
-          db.prepare("SELECT COUNT(*) AS c FROM memory_events").get() as Record<
-            string,
-            unknown
-          >
+          db.prepare("SELECT COUNT(*) AS c FROM memory_events").get() as Record<string, unknown>
         )?.c ?? 0;
-
         const byKind = db
           .prepare(
             "SELECT type, COUNT(*) AS c FROM memory_current WHERE status = 'active' GROUP BY type ORDER BY c DESC",
@@ -255,77 +206,293 @@ export function createMemoryNamespaceStatusTool(input: { config: LcmConfig }): A
   };
 }
 
-// ── memory_list_agents ───────────────────────────────────────────────────────
+type NamespaceMetricsRow = {
+  namespace?: string;
+  memory_count?: number;
+  job_count?: number;
+  active_jobs?: number;
+  ingested_sessions?: number;
+  last_seen_at?: string | null;
+};
 
-export function createMemoryListAgentsTool(_input: { config: LcmConfig }): AnyAgentTool {
+type AgentNamespaceSummary = {
+  namespace: string;
+  memoryCount: number;
+  jobCount: number;
+  activeJobs: number;
+  ingestedSessions: number;
+  lastSeenAt: string | null;
+  synthetic: boolean;
+};
+
+type IngestionToolDeps = Pick<LcmDependencies, "resolveSessionIdFromSessionKey"> &
+  Partial<Pick<LcmDependencies, "parseAgentSessionKey" | "normalizeAgentId">>;
+
+function hasTable(db: DatabaseSync, tableName: string): boolean {
+  return Boolean(
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(tableName),
+  );
+}
+
+function hasColumn(db: DatabaseSync, tableName: string, columnName: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name?: string }>;
+  return rows.some((row) => row.name === columnName);
+}
+
+function getNamespaceEntry(
+  entries: Map<string, AgentNamespaceSummary>,
+  namespace: string,
+): AgentNamespaceSummary {
+  const existing = entries.get(namespace);
+  if (existing) return existing;
+  const created: AgentNamespaceSummary = {
+    namespace,
+    memoryCount: 0,
+    jobCount: 0,
+    activeJobs: 0,
+    ingestedSessions: 0,
+    lastSeenAt: null,
+    synthetic: true,
+  };
+  entries.set(namespace, created);
+  return created;
+}
+
+function mergeLastSeen(current: string | null, candidate: string | null | undefined): string | null {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  return current >= candidate ? current : candidate;
+}
+
+function listAgentNamespaces(params: {
+  config: LcmConfig;
+  currentNamespace: string;
+}): AgentNamespaceSummary[] {
+  const db = getLcmConnection(params.config.databasePath);
+  const entries = new Map<string, AgentNamespaceSummary>();
+
+  if (hasTable(db, "memory_current")) {
+    const rows = db
+      .prepare(`
+        SELECT
+          COALESCE(NULLIF(TRIM(source_agent), ''), ?) AS namespace,
+          COUNT(*) AS memory_count,
+          MAX(updated_at) AS last_seen_at
+        FROM memory_current
+        GROUP BY namespace
+      `)
+      .all(DEFAULT_MEMORY_NAMESPACE) as NamespaceMetricsRow[];
+    for (const row of rows) {
+      const namespace = normalizeMemoryNamespace(String(row.namespace ?? DEFAULT_MEMORY_NAMESPACE));
+      const entry = getNamespaceEntry(entries, namespace);
+      entry.synthetic = false;
+      entry.memoryCount += Number(row.memory_count ?? 0);
+      entry.lastSeenAt = mergeLastSeen(entry.lastSeenAt, row.last_seen_at);
+    }
+  }
+
+  if (hasTable(db, "memory_ingestion_jobs")) {
+    const namespaceExpr = hasColumn(db, "memory_ingestion_jobs", "agent_namespace")
+      ? "COALESCE(NULLIF(TRIM(agent_namespace), ''), 'default')"
+      : "'default'";
+    const rows = db
+      .prepare(`
+        SELECT
+          ${namespaceExpr} AS namespace,
+          COUNT(*) AS job_count,
+          SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END) AS active_jobs,
+          MAX(updated_at) AS last_seen_at
+        FROM memory_ingestion_jobs
+        GROUP BY namespace
+      `)
+      .all() as NamespaceMetricsRow[];
+    for (const row of rows) {
+      const namespace = normalizeMemoryNamespace(String(row.namespace ?? DEFAULT_MEMORY_NAMESPACE));
+      const entry = getNamespaceEntry(entries, namespace);
+      entry.synthetic = false;
+      entry.jobCount += Number(row.job_count ?? 0);
+      entry.activeJobs += Number(row.active_jobs ?? 0);
+      entry.lastSeenAt = mergeLastSeen(entry.lastSeenAt, row.last_seen_at);
+    }
+  }
+
+  if (hasTable(db, "memory_ingestion_state")) {
+    const namespaceExpr = hasColumn(db, "memory_ingestion_state", "agent_namespace")
+      ? "COALESCE(NULLIF(TRIM(agent_namespace), ''), 'default')"
+      : "'default'";
+    const rows = db
+      .prepare(`
+        SELECT
+          ${namespaceExpr} AS namespace,
+          COUNT(*) AS ingested_sessions,
+          MAX(updated_at) AS last_seen_at
+        FROM memory_ingestion_state
+        GROUP BY namespace
+      `)
+      .all() as NamespaceMetricsRow[];
+    for (const row of rows) {
+      const namespace = normalizeMemoryNamespace(String(row.namespace ?? DEFAULT_MEMORY_NAMESPACE));
+      const entry = getNamespaceEntry(entries, namespace);
+      entry.synthetic = false;
+      entry.ingestedSessions += Number(row.ingested_sessions ?? 0);
+      entry.lastSeenAt = mergeLastSeen(entry.lastSeenAt, row.last_seen_at);
+    }
+  }
+
+  getNamespaceEntry(entries, params.currentNamespace);
+
+  return Array.from(entries.values()).sort((left, right) => {
+    if (left.namespace === params.currentNamespace && right.namespace !== params.currentNamespace) return -1;
+    if (right.namespace === params.currentNamespace && left.namespace !== params.currentNamespace) return 1;
+    if (left.namespace === DEFAULT_MEMORY_NAMESPACE && right.namespace !== DEFAULT_MEMORY_NAMESPACE) return -1;
+    if (right.namespace === DEFAULT_MEMORY_NAMESPACE && left.namespace !== DEFAULT_MEMORY_NAMESPACE) return 1;
+    return left.namespace.localeCompare(right.namespace);
+  });
+}
+
+function resolveOptionalNamespaceDeps(
+  deps: IngestionToolDeps | undefined,
+): Pick<LcmDependencies, "parseAgentSessionKey" | "normalizeAgentId"> | undefined {
+  if (!deps?.parseAgentSessionKey || !deps.normalizeAgentId) return undefined;
+  return {
+    parseAgentSessionKey: deps.parseAgentSessionKey,
+    normalizeAgentId: deps.normalizeAgentId,
+  };
+}
+
+export function createMemoryListAgentsTool(input: {
+  config: LcmConfig;
+  deps?: Pick<LcmDependencies, "parseAgentSessionKey" | "normalizeAgentId">;
+  sessionKey?: string;
+}): AnyAgentTool {
   return {
     name: "memory_list_agents",
     label: "List Memory Agents",
     description:
-      "List registered agent namespaces in the memory system. " +
-      "Multi-agent namespacing is available in Engram v2 (P3 feature). " +
-      "Currently returns the default namespace.",
+      "List registered agent namespaces in the memory system. Discovers namespaces from stored memories and ingestion job state.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
+      const currentNamespace = resolveMemoryNamespaceFromSessionContext({
+        deps: input.deps,
+        sessionKey: input.sessionKey,
+      });
+      const agents = listAgentNamespaces({
+        config: input.config,
+        currentNamespace,
+      });
       return jsonResult({
-        agents: [
-          {
-            namespace: "default",
-            status: "active",
-            note: "Multi-agent namespace isolation available in Engram v2 P3.",
-          },
-        ],
+        currentNamespace,
+        agents: agents.map((agent) => ({
+          namespace: agent.namespace,
+          status: agent.activeJobs > 0 ? "ingesting" : "active",
+          current: agent.namespace === currentNamespace,
+          defaultNamespace: agent.namespace === DEFAULT_MEMORY_NAMESPACE,
+          memoryCount: agent.memoryCount,
+          jobCount: agent.jobCount,
+          activeJobs: agent.activeJobs,
+          ingestedSessions: agent.ingestedSessions,
+          lastSeenAt: agent.lastSeenAt,
+          note:
+            agent.synthetic && agent.namespace === DEFAULT_MEMORY_NAMESPACE
+              ? "No agent-specific namespaces have been stored yet."
+              : undefined,
+        })),
       });
     },
   };
 }
 
-// ── memory_ingest_now ────────────────────────────────────────────────────────
+async function resolveIngestionSessionId(input: {
+  deps?: IngestionToolDeps;
+  sessionId?: string;
+  sessionKey?: string;
+  params: Record<string, unknown>;
+}): Promise<string | undefined> {
+  const explicit = typeof input.params.sessionId === "string" ? input.params.sessionId.trim() : "";
+  if (explicit) return explicit;
+  const direct = input.sessionId?.trim();
+  if (direct) return direct;
+  const sessionKey = input.sessionKey?.trim();
+  if (!sessionKey || !input.deps) return undefined;
+  const resolved = await input.deps.resolveSessionIdFromSessionKey(sessionKey);
+  return resolved?.trim() ? resolved.trim() : undefined;
+}
 
-export function createMemoryIngestNowTool(_input: { config: LcmConfig }): AnyAgentTool {
+export function createMemoryIngestNowTool(input: {
+  config: LcmConfig;
+  deps?: IngestionToolDeps;
+  sessionId?: string;
+  sessionKey?: string;
+}): AnyAgentTool {
   return {
     name: "memory_ingest_now",
     label: "Trigger Memory Ingest",
     description:
-      "Trigger immediate ingestion of pending session activity into long-term memory. " +
-      "Background ingestion scheduler is a P3 feature. " +
-      "Use memory_add to manually capture memories in the meantime.",
+      "Trigger immediate ingestion of pending session activity into long-term memory. Creates or resumes a background episodic ingestion job.",
     parameters: Type.Object({
       sessionId: Type.Optional(
         Type.String({ description: "Session ID to ingest. Defaults to current session." }),
       ),
     }),
-    async execute(_toolCallId, _params) {
-      return jsonResult({
-        status: "not_available",
-        message:
-          "Background ingestion scheduler is a P3 feature (not yet implemented). " +
-          "Use memory_add to capture memories manually.",
+    async execute(_toolCallId, params) {
+      const p = params as Record<string, unknown>;
+      const sessionId = await resolveIngestionSessionId({
+        deps: input.deps,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
+        params: p,
       });
+      if (!sessionId) {
+        return jsonResult({
+          error: "No sessionId was provided and the current session could not be resolved from sessionKey.",
+        });
+      }
+
+      const result = enqueueEpisodicIngestionJob({
+        config: input.config,
+        sessionId,
+        agentNamespace: resolveMemoryNamespaceFromSessionContext({
+          deps: resolveOptionalNamespaceDeps(input.deps),
+          sessionKey: input.sessionKey,
+        }),
+      });
+      return jsonResult(result);
     },
   };
 }
 
-// ── memory_job_status ────────────────────────────────────────────────────────
-
-export function createMemoryJobStatusTool(_input: { config: LcmConfig }): AnyAgentTool {
+export function createMemoryJobStatusTool(input: { config: LcmConfig }): AnyAgentTool {
   return {
     name: "memory_job_status",
     label: "Memory Job Status",
     description:
-      "Check the status of a background ingestion job. " +
-      "Background job queue is a P3 feature. " +
-      "Returns not_available until the job scheduler is implemented.",
+      "Check the status of a background ingestion job. Returns queue counts when jobId is omitted.",
     parameters: Type.Object({
       jobId: Type.Optional(
         Type.String({ description: "Job ID to check. If omitted, returns queue summary." }),
       ),
     }),
-    async execute(_toolCallId, _params) {
+    async execute(_toolCallId, params) {
+      kickEpisodicIngestionScheduler(input.config);
+      const p = params as Record<string, unknown>;
+      const jobId = typeof p.jobId === "string" ? p.jobId.trim() : "";
+      if (jobId) {
+        const job = getEpisodicIngestionJob({ config: input.config, jobId });
+        if (!job) {
+          return jsonResult({ error: `Job not found: ${jobId}` });
+        }
+
+        const progress = job.messageCount > 0 ? Math.min(1, job.processedCount / job.messageCount) : 1;
+        return jsonResult({
+          status: job.status,
+          job,
+          progress,
+        });
+      }
+
       return jsonResult({
-        status: "not_available",
-        message: "Background job queue is a P3 feature (not yet implemented).",
-        queue: { pending: 0, running: 0, completed: 0, failed: 0 },
+        status: "ok",
+        queue: getEpisodicIngestionQueueSummary({ config: input.config }),
       });
     },
   };

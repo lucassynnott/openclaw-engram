@@ -117,6 +117,37 @@ function buildOrchestrationObservability(input: {
   };
 }
 
+function resolveSingleConversationId(
+  matches: Array<{ conversationId?: number | null }>,
+): number | undefined | null {
+  const conversationIds = Array.from(
+    new Set(
+      matches
+        .map((match) =>
+          typeof match.conversationId === "number" && Number.isFinite(match.conversationId)
+            ? Math.trunc(match.conversationId)
+            : undefined,
+        )
+        .filter((value): value is number => typeof value === "number"),
+    ),
+  );
+  if (conversationIds.length === 0) {
+    return undefined;
+  }
+  if (conversationIds.length === 1) {
+    return conversationIds[0];
+  }
+  return null;
+}
+
+function delegatedConversationScopeError(action: "expand" | "query"): ReturnType<typeof jsonResult> {
+  return jsonResult({
+    error:
+      `Delegated ${action} requires a single conversation scope. ` +
+      "Provide conversationId, or narrow the request to summaryIds/results from one conversation.",
+  });
+}
+
 /**
  * Build the runtime LCM expansion tool with route-vs-delegate orchestration.
  */
@@ -170,13 +201,6 @@ export function createLcmExpandTool(input: {
       const authorizedOrchestrator =
         delegatedGrantId !== undefined ? wrapWithAuth(orchestrator, runtimeAuthManager) : null;
 
-      if (isDelegatedSession && !delegatedGrantId) {
-        return jsonResult({
-          error:
-            "Delegated expansion requires a valid grant. This sub-agent session has no propagated expansion grant.",
-        });
-      }
-
       const conversationScope = await resolveLcmConversationScope({
         lcm: input.lcm,
         deps: input.deps,
@@ -203,10 +227,11 @@ export function createLcmExpandTool(input: {
         (delegatedGrant?.allowedConversationIds.length === 1
           ? delegatedGrant.allowedConversationIds[0]
           : undefined);
+      const requiresDerivedScope = isDelegatedSession && !delegatedGrantId;
 
       if (query) {
         try {
-          if (resolvedConversationId == null) {
+          if (resolvedConversationId == null && !requiresDerivedScope) {
             const result = await orchestrator.describeAndExpand({
               query,
               mode: "full_text",
@@ -245,6 +270,37 @@ export function createLcmExpandTool(input: {
             scope: "summaries",
             conversationId: resolvedConversationId,
           });
+          const derivedConversationId =
+            resolvedConversationId ??
+            (() => {
+              const inferred = resolveSingleConversationId(grepResult.summaries);
+              if (inferred === null) {
+                return null;
+              }
+              return inferred;
+            })();
+          if (requiresDerivedScope && derivedConversationId == null) {
+            return derivedConversationId === undefined
+              ? {
+                  content: [{ type: "text", text: distillForSubagent(makeEmptyExpansionResult()) }],
+                  details: {
+                    expansionCount: 0,
+                    citedIds: [],
+                    totalTokens: 0,
+                    truncated: false,
+                    policy: decideLcmExpansionRouting({
+                      intent: "query_probe",
+                      query,
+                      requestedMaxDepth: maxDepth,
+                      candidateSummaryCount: 0,
+                      tokenCap: tokenCap ?? Number.MAX_SAFE_INTEGER,
+                      includeMessages: false,
+                    }),
+                    executionPath: "direct",
+                  },
+                }
+              : delegatedConversationScopeError("query");
+          }
           const matchedSummaryIds = grepResult.summaries.map((entry) => entry.summaryId);
           const policy = decideLcmExpansionRouting({
             intent: "query_probe",
@@ -260,11 +316,11 @@ export function createLcmExpandTool(input: {
             !isDelegatedSession &&
             !!sessionKey;
           const delegated =
-            canDelegate && resolvedConversationId != null
+            canDelegate && derivedConversationId != null
               ? await runDelegatedExpansionLoop({
                   deps: input.deps,
                   requesterSessionKey: sessionKey,
-                  conversationId: resolvedConversationId,
+                  conversationId: derivedConversationId,
                   summaryIds: matchedSummaryIds,
                   maxDepth,
                   tokenCap,
@@ -301,7 +357,7 @@ export function createLcmExpandTool(input: {
                   maxDepth,
                   tokenCap,
                   includeMessages: false,
-                  conversationId: resolvedConversationId,
+                  conversationId: derivedConversationId ?? 0,
                 });
           const text = distillForSubagent(result);
           return {
@@ -336,6 +392,8 @@ export function createLcmExpandTool(input: {
 
       if (summaryIds && summaryIds.length > 0) {
         try {
+          let inferredConversationId: number | undefined;
+          const describedConversationIds = new Set<number>();
           if (conversationScope.conversationId != null) {
             const outOfScope: string[] = [];
             for (const summaryId of summaryIds) {
@@ -346,6 +404,9 @@ export function createLcmExpandTool(input: {
               ) {
                 outOfScope.push(summaryId);
               }
+              if (described?.type === "summary" && typeof described.summary?.conversationId === "number") {
+                describedConversationIds.add(described.summary.conversationId);
+              }
             }
             if (outOfScope.length > 0) {
               return jsonResult({
@@ -355,6 +416,17 @@ export function createLcmExpandTool(input: {
                 hint: "Use allConversations=true for cross-conversation expansion.",
               });
             }
+          } else if (requiresDerivedScope) {
+            for (const summaryId of summaryIds) {
+              const described = await retrieval.describe(summaryId);
+              if (described?.type === "summary" && typeof described.summary?.conversationId === "number") {
+                describedConversationIds.add(described.summary.conversationId);
+              }
+            }
+            if (describedConversationIds.size > 1) {
+              return delegatedConversationScopeError("expand");
+            }
+            inferredConversationId = Array.from(describedConversationIds)[0];
           }
 
           const policy = decideLcmExpansionRouting({
@@ -365,17 +437,21 @@ export function createLcmExpandTool(input: {
             includeMessages,
           });
           const normalizedSummaryIds = normalizeSummaryIds(summaryIds);
+          const effectiveConversationId = resolvedConversationId ?? inferredConversationId;
+          if (requiresDerivedScope && effectiveConversationId == null) {
+            return delegatedConversationScopeError("expand");
+          }
           const canDelegate =
             normalizedSummaryIds.length > 0 &&
             policy.action === "delegate_traversal" &&
             !isDelegatedSession &&
             !!sessionKey &&
-            resolvedConversationId != null;
+            effectiveConversationId != null;
           const delegated = canDelegate
             ? await runDelegatedExpansionLoop({
                 deps: input.deps,
                 requesterSessionKey: sessionKey,
-                conversationId: resolvedConversationId,
+                conversationId: effectiveConversationId,
                 summaryIds: normalizedSummaryIds,
                 maxDepth,
                 tokenCap,
@@ -407,7 +483,7 @@ export function createLcmExpandTool(input: {
             maxDepth,
             tokenCap,
             includeMessages,
-            conversationId: resolvedConversationId ?? 0,
+            conversationId: effectiveConversationId ?? 0,
           });
           const text = distillForSubagent(result);
           return {

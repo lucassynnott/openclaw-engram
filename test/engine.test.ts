@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/context/assembler.js";
@@ -10,12 +9,13 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/context/engine.js";
 import type { LcmDependencies } from "../src/types.js";
+import { makeTestConfig } from "./test-config.js";
 
 const tempDirs: string[] = [];
+type AgentMessage = Parameters<LcmContextEngine["ingest"]>[0]["message"];
 
 function createTestConfig(databasePath: string): LcmConfig {
-  return {
-    enabled: true,
+  return makeTestConfig({
     databasePath,
     contextThreshold: 0.75,
     freshTailCount: 8,
@@ -42,7 +42,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     vaultReportsEnabled: true,
     obsidianMode: "curated",
     obsidianExportDiagnostics: false,
-  };
+  });
 }
 
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -149,6 +149,13 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
     content: params.content,
     timestamp: Date.now(),
   } as AgentMessage;
+}
+
+function appendSessionMessage<TMessage, TResult>(
+  sm: { appendMessage: (message: TMessage) => TResult },
+  message: AgentMessage,
+): TResult {
+  return sm.appendMessage(message as unknown as TMessage);
 }
 
 function estimateAssembledPayloadTokens(messages: AgentMessage[]): number {
@@ -404,22 +411,22 @@ describe("LcmContextEngine.bootstrap", () => {
     const sessionFile = createSessionFilePath("branched");
     const sm = SessionManager.open(sessionFile);
 
-    const rootUserId = sm.appendMessage({
+    const rootUserId = appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "root user" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "abandoned assistant" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "abandoned user" }],
     } as AgentMessage);
 
     // Re-branch from the first user entry so prior turns are abandoned.
     sm.branch(rootUserId);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "active assistant" }],
     } as AgentMessage);
@@ -454,11 +461,11 @@ describe("LcmContextEngine.bootstrap", () => {
   it("is idempotent and does not duplicate already bootstrapped sessions", async () => {
     const sessionFile = createSessionFilePath("idempotent");
     const sm = SessionManager.open(sessionFile);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "first" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "second" }],
     } as AgentMessage);
@@ -485,11 +492,11 @@ describe("LcmContextEngine.bootstrap", () => {
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-tail");
     const sm = SessionManager.open(sessionFile);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "seed user" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "seed assistant" }],
     } as AgentMessage);
@@ -501,11 +508,11 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(first.bootstrapped).toBe(true);
     expect(first.importedMessages).toBe(2);
 
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "lost user turn" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "lost assistant turn" }],
     } as AgentMessage);
@@ -529,19 +536,19 @@ describe("LcmContextEngine.bootstrap", () => {
   it("reconciles missing structured tool-call tail when prior empty tool content exists", async () => {
     const sessionFile = createSessionFilePath("reconcile-tool-tail");
     const sm = SessionManager.open(sessionFile);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "seed user" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "seed assistant" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "toolCall", id: "call_existing", name: "read", input: { path: "a.txt" } }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "toolResult",
       toolCallId: "call_existing",
       content: [{ type: "tool_result", tool_use_id: "call_existing", output: { ok: true } }],
@@ -554,11 +561,11 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(first.bootstrapped).toBe(true);
     expect(first.importedMessages).toBe(4);
 
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "toolCall", id: "call_missing", name: "read", input: { path: "b.txt" } }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "toolResult",
       toolCallId: "call_missing",
       content: [{ type: "tool_result", tool_use_id: "call_missing", output: { ok: true } }],
@@ -582,11 +589,11 @@ describe("LcmContextEngine.bootstrap", () => {
   it("does not append JSONL when no overlapping anchor exists in LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-no-overlap");
     const sm = SessionManager.open(sessionFile);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "json only user" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "json only assistant" }],
     } as AgentMessage);
@@ -616,11 +623,11 @@ describe("LcmContextEngine.bootstrap", () => {
   it("uses the bulk import path for initial bootstrap", async () => {
     const sessionFile = createSessionFilePath("bulk");
     const sm = SessionManager.open(sessionFile);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "user",
       content: [{ type: "text", text: "bulk one" }],
     } as AgentMessage);
-    sm.appendMessage({
+    appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "bulk two" }],
     } as AgentMessage);

@@ -1,5 +1,5 @@
 /**
- * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
+ * Engram — unified memory and context engine plugin for OpenClaw.
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
@@ -8,13 +8,57 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "./src/db/config.js";
+import { getLcmConnection } from "./src/db/connection.js";
 import { LcmContextEngine } from "./src/context/engine.js";
+import {
+  createAlignmentCheckTool,
+  createAlignmentDriftTool,
+  createAlignmentStatusTool,
+} from "./src/surface/alignment-tools.js";
+import {
+  createContextDescribeTool,
+  createContextExpandTool,
+  createContextGrepTool,
+  createContextQueryTool,
+} from "./src/surface/context-compat.js";
+import {
+  createMemoryGetEntityTool,
+  createMemoryGetEpisodeTool,
+  createMemoryIngestNowTool,
+  createMemoryJobStatusTool,
+  createMemoryListAgentsTool,
+  createMemoryNamespaceStatusTool,
+} from "./src/surface/episodic-tools.js";
+import {
+  createEntityGetTool,
+  createGradientScoreTool,
+  createMemoryGetTool,
+  createOpsStatusTool,
+  createVaultQueryTool,
+} from "./src/surface/engram-v2-compat-tools.js";
+import {
+  captureMemoryNotesFromAgentEnd,
+  sanitizeMemoryNoteMessage,
+} from "./src/memory/capture.js";
+import { ensureMemoryTables } from "./src/memory/memory-schema.js";
+import { ensureMemoryVectorTables } from "./src/memory/vector-search.js";
+import {
+  clearVectorRuntime,
+  createFalkorVectorBackend,
+  createOpenAiCompatibleEmbeddingProvider,
+  registerVectorRuntime,
+  type VectorRuntime,
+} from "./src/memory/vector-runtime.js";
 import { createLcmDescribeTool } from "./src/surface/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/surface/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/surface/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/surface/lcm-grep-tool.js";
 import { createMemoryAddTool } from "./src/surface/memory-add-tool.js";
-import { createLcmHttpHandler } from "./src/surface/http-routes.js";
+import { createMemoryQueryTool } from "./src/surface/memory-query-tool.js";
+import { createMemoryRecallTool } from "./src/surface/memory-recall-tool.js";
+import { createMemorySearchTool } from "./src/surface/memory-search-tool.js";
+import { createMemoryWorldTool } from "./src/surface/memory-world-tool.js";
+import { registerLcmHttpRoutes } from "./src/surface/http-routes.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -104,8 +148,8 @@ const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
   return {
-    lcmSummaryModel: env.LCM_SUMMARY_MODEL?.trim() ?? "",
-    lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    lcmSummaryModel: env.ENGRAM_SUMMARY_MODEL?.trim() || env.LCM_SUMMARY_MODEL?.trim() || "",
+    lcmSummaryProvider: env.ENGRAM_SUMMARY_PROVIDER?.trim() || env.LCM_SUMMARY_PROVIDER?.trim() || "",
     pluginSummaryModel: "",
     pluginSummaryProvider: "",
     openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
@@ -374,10 +418,10 @@ function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): 
 
 function buildLegacyAuthFallbackWarning(): string {
   return [
-    "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
-    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
+    "[engram] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
+    `Engram expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
     `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
-    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
+    `${MODEL_AUTH_REQUIRED_RELEASE} is required for Engram without this fallback patch.`,
   ].join(" ");
 }
 
@@ -992,7 +1036,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             );
           } catch (err) {
             console.error(
-              `[lcm] modelAuth.resolveApiKeyForProvider FAILED:`,
+              `[engram] modelAuth.resolveApiKeyForProvider FAILED:`,
               err instanceof Error ? err.message : err,
             );
           }
@@ -1088,15 +1132,42 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           request_temperature_sent: typeof completeOptions.temperature === "number" ? "true" : "false",
         };
       } catch (err) {
-        console.error(`[lcm] completeSimple error:`, err instanceof Error ? err.message : err);
+        console.error(`[engram] completeSimple error:`, err instanceof Error ? err.message : err);
         return { content: [] };
       }
     },
     callGateway: async (params) => {
-      const sub = api.runtime.subagent;
+      // Subagent API may not be available in all OpenClaw versions
+      const sub = (api.runtime as Record<string, unknown>)?.subagent;
+      if (!sub || typeof sub !== 'object') {
+        throw new Error(`Subagent API not available in this OpenClaw version`);
+      }
+      const subagent = sub as {
+        run?: (opts: unknown) => Promise<unknown>;
+        waitForRun?: (opts: unknown) => Promise<unknown>;
+        getSessionMessages?: (opts: unknown) => Promise<unknown>;
+        getSession?: (opts: unknown) => Promise<unknown>;
+        deleteSession?: (opts: unknown) => Promise<void>;
+      };
+      const run = typeof subagent.run === "function" ? subagent.run.bind(subagent) : undefined;
+      const waitForRun =
+        typeof subagent.waitForRun === "function" ? subagent.waitForRun.bind(subagent) : undefined;
+      const getSessionMessages =
+        typeof subagent.getSessionMessages === "function"
+          ? subagent.getSessionMessages.bind(subagent)
+          : typeof subagent.getSession === "function"
+            ? subagent.getSession.bind(subagent)
+            : undefined;
+      const deleteSession =
+        typeof subagent.deleteSession === "function"
+          ? subagent.deleteSession.bind(subagent)
+          : undefined;
+      if (!run || !waitForRun || !getSessionMessages || !deleteSession) {
+        throw new Error(`Subagent API not available in this OpenClaw version`);
+      }
       switch (params.method) {
         case "agent":
-          return sub.run({
+          return run({
             sessionKey: String(params.params?.sessionKey ?? ""),
             message: String(params.params?.message ?? ""),
             extraSystemPrompt: params.params?.extraSystemPrompt as string | undefined,
@@ -1105,17 +1176,17 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             idempotencyKey: params.params?.idempotencyKey as string | undefined,
           });
         case "agent.wait":
-          return sub.waitForRun({
+          return waitForRun({
             runId: String(params.params?.runId ?? ""),
             timeoutMs: (params.params?.timeoutMs as number) ?? params.timeoutMs,
           });
         case "sessions.get":
-          return sub.getSession({
+          return getSessionMessages({
             sessionKey: String(params.params?.key ?? ""),
             limit: params.params?.limit as number | undefined,
           });
         case "sessions.delete":
-          await sub.deleteSession({
+          await deleteSession({
             sessionKey: String(params.params?.key ?? ""),
             deleteTranscript: (params.params?.deleteTranscript as boolean) ?? true,
           });
@@ -1267,11 +1338,104 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   };
 }
 
+function buildVectorRuntime(api: OpenClawPluginApi, deps: LcmDependencies): VectorRuntime | undefined {
+  if (!deps.config.enabled) {
+    return undefined;
+  }
+
+  let runtimeConfig: unknown = api.config;
+  try {
+    const loaded = api.runtime?.config?.loadConfig?.();
+    if (loaded !== undefined) {
+      runtimeConfig = loaded;
+    }
+  } catch {
+    // Fall back to api.config.
+  }
+
+  const providers = isRecord(runtimeConfig)
+    ? (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models?.providers
+    : undefined;
+  const providerId = deps.config.vectorEmbeddingProvider.trim();
+  const modelId = deps.config.vectorEmbeddingModel.trim();
+  const providerCfg = findProviderConfigValue(
+    isRecord(providers) ? (providers as Record<string, unknown>) : undefined,
+    providerId,
+  );
+  const providerRecord = isRecord(providerCfg) ? providerCfg : {};
+
+  const providerRuntime =
+    providerId && modelId
+      ? createOpenAiCompatibleEmbeddingProvider({
+          provider: providerId,
+          model: modelId,
+          baseUrl: typeof providerRecord.baseUrl === "string" ? providerRecord.baseUrl : undefined,
+          headers: isRecord(providerRecord.headers)
+            ? Object.fromEntries(
+                Object.entries(providerRecord.headers)
+                  .filter(([, value]) => typeof value === "string")
+                  .map(([key, value]) => [key, String(value)]),
+              )
+            : undefined,
+          getApiKey: async () => {
+            const key = await deps.getApiKey(providerId, modelId).catch(() => undefined);
+            if (key?.trim()) {
+              return key.trim();
+            }
+            return typeof providerRecord.apiKey === "string" && providerRecord.apiKey.trim()
+              ? providerRecord.apiKey.trim()
+              : undefined;
+          },
+          logger: deps.log,
+        })
+      : undefined;
+
+  const wantsFalkor =
+    deps.config.falkorDbEnabled || deps.config.vectorBackend.trim().toLowerCase() === "falkordb";
+  const falkorRuntime = wantsFalkor
+    ? createFalkorVectorBackend({
+        host: deps.config.falkorDbHost,
+        port: deps.config.falkorDbPort,
+        password: deps.config.falkorDbPassword,
+        graphName: deps.config.falkorDbKnowledgeGraph,
+        logger: deps.log,
+      })
+    : undefined;
+
+  if (!providerRuntime && !falkorRuntime) {
+    return undefined;
+  }
+
+  return {
+    embedderLabel: providerRuntime?.embedderLabel,
+    externalBackendLabel: falkorRuntime?.externalBackendLabel,
+    backendLabel: [providerRuntime?.backendLabel, falkorRuntime?.backendLabel].filter(Boolean).join("+"),
+    embedText: providerRuntime?.embedText,
+    upsertExternalMemoryVector: falkorRuntime?.upsertExternalMemoryVector,
+    queryExternalNeighbors: falkorRuntime?.queryExternalNeighbors,
+    getStats: async () => {
+      const stats: Record<string, unknown> = {
+        embedder: providerRuntime?.embedderLabel || "local_dense_v1",
+        external_backend: falkorRuntime?.externalBackendLabel || "none",
+        vector_backend: deps.config.vectorBackend,
+      };
+      if (typeof falkorRuntime?.getStats === "function") {
+        stats.falkordb = await falkorRuntime.getStats();
+      }
+      return stats;
+    },
+    close: async () => {
+      await falkorRuntime?.close?.();
+    },
+  };
+}
+
 const lcmPlugin = {
-  id: "lossless-claw",
-  name: "Lossless Context Management",
+  id: "engram",
+  name: "Engram",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
+  kind: "memory" as const,
 
   configSchema: {
     parse(value: unknown) {
@@ -1285,20 +1449,62 @@ const lcmPlugin = {
 
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
+    void clearVectorRuntime(deps.config.databasePath);
+    const vectorRuntime = buildVectorRuntime(api, deps);
+    if (vectorRuntime) {
+      registerVectorRuntime(deps.config.databasePath, vectorRuntime);
+    }
+    const db = getLcmConnection(deps.config.databasePath);
+    ensureMemoryTables(db);
+    ensureMemoryVectorTables(db, deps.config);
     const lcm = new LcmContextEngine(deps);
 
-    api.registerContextEngine("lossless-claw", () => lcm);
+    // registerContextEngine may not be available in all OpenClaw versions
+    const registerCE = (api as Record<string, unknown>).registerContextEngine;
+    const engineId = typeof api.id === "string" && api.id.trim() ? api.id.trim() : "engram";
+    if (typeof registerCE === "function") {
+      (registerCE as (...args: unknown[]) => void).call(api, engineId, () => lcm);
+    }
 
     // Register web-console HTTP routes at /memory/*
     const gatewayToken = String(
       (api.config as Record<string, unknown> & { gateway?: { auth?: { token?: string } } })
         ?.gateway?.auth?.token ?? "",
     ).trim();
-    const lcmHttpHandler = createLcmHttpHandler({
+    registerLcmHttpRoutes({
+      api,
       config: deps.config,
       gatewayToken: gatewayToken || undefined,
     });
-    api.registerHttpHandler(lcmHttpHandler);
+    api.registerTool((ctx) =>
+      createContextGrepTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createContextDescribeTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createContextExpandTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createContextQueryTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+        requesterSessionKey: ctx.sessionKey,
+      }),
+    );
     api.registerTool((ctx) =>
       createLcmGrepTool({
         deps,
@@ -1329,10 +1535,89 @@ const lcmPlugin = {
       }),
     );
 
-    api.registerTool(() => createMemoryAddTool({ config: deps.config }));
+    const eventApi = api as OpenClawPluginApi & {
+      on?: OpenClawPluginApi["on"];
+    };
+    if (typeof eventApi.on === "function") {
+      eventApi.on("before_message_write", (event) => {
+        const sanitized = sanitizeMemoryNoteMessage(event.message);
+        if (!sanitized) {
+          return undefined;
+        }
+        if ("block" in sanitized && sanitized.block) {
+          return { block: true };
+        }
+        if ("message" in sanitized) {
+          return { message: sanitized.message };
+        }
+        return undefined;
+      });
+      eventApi.on(
+        "agent_end",
+        async (event: { messages: unknown[] }, ctx: { agentId?: string; sessionKey?: string }) => {
+          try {
+            const summary = captureMemoryNotesFromAgentEnd({
+              config: deps.config,
+              messages: event.messages,
+              agentId: ctx.agentId,
+              sessionKey: ctx.sessionKey,
+              minConfidence: deps.config.captureMinConfidence,
+            });
+            if (summary.processed > 0) {
+              api.logger.info(
+                `[engram] capture processed=${summary.processed} stored=${summary.stored} low_confidence=${summary.skippedLowConfidence} rejected=${summary.rejected}`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(
+              `[engram] capture hook error: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        },
+      );
+    }
+
+    api.registerTool((ctx) =>
+      createMemoryAddTool({
+        config: deps.config,
+        deps,
+        sessionKey: ctx.sessionKey,
+        resolveAgentDir: deps.resolveAgentDir,
+      }),
+    );
+    api.registerTool(() => createMemoryRecallTool({ config: deps.config }));
+    api.registerTool(() => createMemorySearchTool({ config: deps.config }));
+    api.registerTool(() => createMemoryQueryTool({ config: deps.config }));
+    api.registerTool(() => createMemoryWorldTool({ config: deps.config }));
+    api.registerTool(() => createMemoryGetTool({ config: deps.config }));
+    api.registerTool(() => createEntityGetTool({ config: deps.config }));
+    api.registerTool(() => createMemoryGetEntityTool({ config: deps.config }));
+    api.registerTool(() => createMemoryGetEpisodeTool({ config: deps.config }));
+    api.registerTool(() => createVaultQueryTool({ config: deps.config }));
+    api.registerTool(() => createOpsStatusTool({ config: deps.config }));
+    api.registerTool(() => createMemoryNamespaceStatusTool({ config: deps.config }));
+    api.registerTool((ctx) =>
+      createMemoryListAgentsTool({
+        config: deps.config,
+        deps,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createMemoryIngestNowTool({
+        config: deps.config,
+        deps,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool(() => createMemoryJobStatusTool({ config: deps.config }));
+    api.registerTool(() => createAlignmentStatusTool({ config: deps.config }));
+    api.registerTool(() => createGradientScoreTool({ config: deps.config }));
+    api.registerTool(() => createAlignmentCheckTool({ config: deps.config }));
+    api.registerTool(() => createAlignmentDriftTool({ config: deps.config }));
 
     api.logger.info(
-      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      `[engram] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
     );
   },
 };

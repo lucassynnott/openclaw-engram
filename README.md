@@ -12,7 +12,7 @@
 
 Unified memory and context engine plugin for [OpenClaw](https://github.com/openclaw/openclaw). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message, adds pre-compaction fact extraction, and provides persistent cross-session memory for all your agents.
 
-One install, one config, one database.
+One install, one config, one database. The default database path remains `~/.openclaw/lcm.db` for backward compatibility, but the preferred config surface now uses `ENGRAM_*` environment variables and the `engram` plugin entry.
 
 ## Table of contents
 
@@ -79,9 +79,9 @@ The install command records the plugin, enables it, and wires it into the `conte
 Add these to your environment or OpenClaw config:
 
 ```bash
-LCM_FRESH_TAIL_COUNT=32
-LCM_INCREMENTAL_MAX_DEPTH=-1
-LCM_CONTEXT_THRESHOLD=0.75
+ENGRAM_COMPACTION_FRESH_TAIL_COUNT=32
+ENGRAM_COMPACTION_INCREMENTAL_MAX_DEPTH=-1
+ENGRAM_COMPACTION_CONTEXT_THRESHOLD=0.75
 ```
 
 - `FRESH_TAIL_COUNT=32` — protects the last 32 messages from compaction (recent context stays raw)
@@ -105,7 +105,7 @@ This keeps sessions alive across idle gaps so memory accumulates over weeks, not
 
 ## Configuration
 
-engram is configured through plugin config or environment variables. Environment variables take precedence.
+engram is configured through plugin config or environment variables. Environment variables take precedence. Prefer `ENGRAM_*` variables for new installs; legacy `LCM_*` aliases are still accepted.
 
 ### Plugin config
 
@@ -132,25 +132,29 @@ Add an `engram` entry under `plugins.entries` in your OpenClaw config:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LCM_ENABLED` | `true` | Enable/disable the plugin |
-| `LCM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database |
-| `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
-| `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
-| `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
-| `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
-| `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only, -1 = unlimited) |
-| `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
-| `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
-| `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
-| `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
-| `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
-| `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
-| `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
-| `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
-| `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
+| `ENGRAM_ENABLED` | `true` | Enable/disable the plugin |
+| `ENGRAM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database (legacy default path retained for compatibility) |
+| `ENGRAM_COMPACTION_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
+| `ENGRAM_COMPACTION_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
+| `ENGRAM_COMPACTION_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
+| `ENGRAM_COMPACTION_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
+| `ENGRAM_COMPACTION_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
+| `ENGRAM_COMPACTION_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only, -1 = unlimited) |
+| `ENGRAM_COMPACTION_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
+| `ENGRAM_COMPACTION_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
+| `ENGRAM_COMPACTION_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
+| `ENGRAM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
+| `ENGRAM_LARGEFILES_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
+| `ENGRAM_LARGEFILES_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
+| `ENGRAM_LARGEFILES_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
+| `ENGRAM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
+| `ENGRAM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
+| `ENGRAM_COMPACTION_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
+| `ENGRAM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from Engram storage |
+| `ENGRAM_VECTOR_BACKEND` | `sqlite_vec` | Vector backend: `sqlite_vec`, `falkordb`, or `none` |
+| `ENGRAM_VECTOR_EMBEDDING_PROVIDER` | `openai` | Embedding provider name for OpenAI-compatible embedding APIs |
+| `ENGRAM_VECTOR_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model used for provider-backed vector indexing |
+| `ENGRAM_FALKORDB_ENABLED` | `false` | Enable FalkorDB vector mirroring / external nearest-neighbor search |
 
 ### OpenClaw session reset settings
 
@@ -175,10 +179,15 @@ Once installed, your agents automatically have access to:
 
 | Tool | What it does |
 |------|-------------|
-| `lcm_grep` | Full-text search across all stored conversation history |
-| `lcm_describe` | Get a summary with metadata for any stored summary node |
-| `lcm_expand` / `lcm_expand_query` | Recursively expand summaries back to source messages |
-| `memory_query` | Semantic search across all captured episodes and facts |
+| `context_grep` / `lcm_grep` | Full-text search across stored conversation history |
+| `context_describe` / `lcm_describe` | Inspect summaries and stored file references |
+| `context_query` / `lcm_expand_query` | Ask focused questions against compacted history |
+| `memory_add` | Persist durable facts, decisions, preferences, and episodes |
+| `memory_search` / `memory_query` | Search and strategy-query durable memory |
+| `memory_get` / `entity_get` | Fetch memories and rich entity profiles directly by ID |
+| `memory_ingest_now` / `memory_job_status` | Queue and inspect background episodic ingestion jobs |
+| `memory_list_agents` | List discovered memory namespaces |
+| `vault_query` / `ops_status` / `gradient_score` | Query the vault mirror, inspect system health, and evaluate responses against the local alignment guardrails |
 
 No configuration changes to your agent prompts. No new workflows to learn. The memory just works.
 
@@ -187,6 +196,7 @@ No configuration changes to your agent prompts. No new workflows to learn. The m
 - [Architecture](docs/architecture.md)
 - [Configuration guide](docs/configuration.md)
 - [Agent tools reference](docs/agent-tools.md)
+- [Live rollout checklist](docs/live-rollout.md)
 - [TUI Reference](docs/tui.md)
 - [lcm-tui](tui/README.md)
 - [Optional: enable FTS5 for fast full-text search](docs/fts5.md)

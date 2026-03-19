@@ -12,7 +12,7 @@ Tool mapping from all three legacy systems to the unified Engram v2 namespace.
 | 6 | OpenStinger Gradient (alignment) |
 | 6 | OpenStinger Scaffold/Vault |
 | **26 raw** | Total legacy tools |
-| **19 unified** | Engram v2 agent-facing tools |
+| **24 unified** | Engram v2 agent-facing tools |
 
 ---
 
@@ -34,14 +34,14 @@ Tool mapping from all three legacy systems to the unified Engram v2 namespace.
 | `memory_add` | Engram/LCM | `memory_add` | ✅ Implemented | Merges Engram + OpenStinger `memory_add`; writes to `memory_current` |
 | *(Gigabrain capture hook)* | Gigabrain | `memory_add` | ✅ Routed | Gigabrain auto-capture writes via same path |
 | *(Gigabrain recall hook)* | Gigabrain | `memory_recall` | ✅ Implemented | New explicit recall tool; surfaces top-k by confidence |
-| `memory_search` | OpenStinger Tier 1 | `memory_search` | ✅ Implemented | FTS5 + LIKE fallback over `memory_current` |
+| `memory_search` | OpenStinger Tier 1 | `memory_search` | ✅ Implemented | Hybrid lexical + vector recall over `memory_current` with native `sqlite-vec`, provider embeddings, and optional FalkorDB neighbors |
 | `memory_query` | OpenStinger Tier 1 | `memory_query` | ✅ Implemented | Adds `afterDate`/`beforeDate` temporal filtering |
 | `memory_get_entity` | OpenStinger Tier 1 | `memory_get_entity` | ✅ Implemented | Reads `memory_entities` table |
 | `memory_get_episode` | OpenStinger Tier 1 | `memory_get_episode` | ✅ Implemented | Reads `memory_episodes` table |
-| `memory_ingest_now` | OpenStinger Tier 1 | `memory_ingest_now` | 🔲 Stub (P3) | Background scheduler not yet implemented |
+| `memory_ingest_now` | OpenStinger Tier 1 | `memory_ingest_now` | ✅ Implemented | Queues or resumes durable SQLite-backed episodic ingestion jobs |
 | `memory_namespace_status` | OpenStinger Tier 1 | `memory_namespace_status` | ✅ Implemented | Aggregated stats over all `memory_*` tables |
-| `memory_list_agents` | OpenStinger Tier 1 | `memory_list_agents` | 🔲 Stub (P3) | Multi-agent namespacing is a P3 feature |
-| `memory_job_status` | OpenStinger Tier 1 | `memory_job_status` | 🔲 Stub (P3) | Job queue not yet implemented |
+| `memory_list_agents` | OpenStinger Tier 1 | `memory_list_agents` | ✅ Implemented | Discovers namespaces from stored memories and ingestion state |
+| `memory_job_status` | OpenStinger Tier 1 | `memory_job_status` | ✅ Implemented | Reads durable SQLite-backed job state and queue summaries |
 | *(Gigabrain world model)* | Gigabrain | `memory_world` | ✅ Implemented | Surfaces `memory_entities` with associated memories |
 
 ---
@@ -50,20 +50,20 @@ Tool mapping from all three legacy systems to the unified Engram v2 namespace.
 
 | Legacy Name | System | New Name | Status | Notes |
 |-------------|--------|----------|--------|-------|
-| `gradient_status` | OpenStinger Gradient | `alignment_status` | 🔲 Stub (P3) | Gradient engine not yet ported |
-| `gradient_alignment_score` | OpenStinger Gradient | `alignment_check` | 🔲 Stub (P3) | Gradient engine not yet ported |
-| `gradient_drift_status` | OpenStinger Gradient | `alignment_drift` | 🔲 Stub (P3) | Gradient engine not yet ported |
+| `gradient_status` | OpenStinger Gradient | `alignment_status` | ✅ Implemented | Returns local profile mode, recent sample counts, and drift alerts |
+| `gradient_alignment_score` | OpenStinger Gradient | `alignment_check` | ✅ Implemented | Heuristic local evaluator with persisted scoring and recommendations |
+| `gradient_drift_status` | OpenStinger Gradient | `alignment_drift` | ✅ Implemented | Rolling drift view backed by stored evaluations |
 | `gradient_alignment_log` | OpenStinger Gradient | **Dropped** | — | Internal operational detail, not agent-facing |
 | `gradient_alert` | OpenStinger Gradient | **Dropped** | — | Surfaced via `alignment_status` |
 | `gradient_history` | OpenStinger Gradient | **Dropped** | — | Internal operational detail |
 
 ---
 
-## Vault Tools (Dropped from agent surface)
+## Vault Tools
 
-OpenStinger vault tools (`vault_status`, `vault_sync_now`, `vault_stats`, `vault_promote_now`, `vault_note_list`, `vault_note_get`) are **not exposed as agent-facing tools** in Engram v2.
+Engram v2 exposes `vault_query` as the single agent-facing vault tool. Operational vault tools (`vault_status`, `vault_sync_now`, `vault_stats`, `vault_promote_now`, `vault_note_list`, `vault_note_get`) stay internal.
 
-Rationale: vault operations are system-managed (cron/hooks). Agents don't need to trigger them. The vault build is handled by `memory_vault_build` in the vault surface layer (see APP-129).
+Rationale: vault reads are useful to agents, but vault mutation and sync operations are system-managed (cron/hooks). The vault build is handled by `memory_vault_build` in the vault surface layer (see APP-129).
 
 ---
 
@@ -102,12 +102,12 @@ memory_world          Surface entity model (people, projects, orgs)
 memory_get_entity     Fetch entity by UUID
 memory_get_episode    Fetch episode by UUID
 memory_namespace_status  Memory store health + stats
-memory_ingest_now     [P3 stub] Trigger background ingestion
-memory_list_agents    [P3 stub] List agent namespaces
-memory_job_status     [P3 stub] Check background job status
+memory_ingest_now     Trigger background ingestion of session activity
+memory_list_agents    List discovered agent namespaces
+memory_job_status     Check ingestion job status or queue summary
 ```
 
-### Alignment namespace (3 tools — P3 stubs)
+### Alignment namespace (3 tools)
 
 ```
 alignment_status      Engine health + profile state
@@ -115,4 +115,14 @@ alignment_check       Evaluate text/action for alignment
 alignment_drift       Rolling drift statistics
 ```
 
-**Total: 19 agent-facing tools (+ 4 backward-compat aliases)**
+### Compatibility / ops namespace (5 tools)
+
+```
+memory_get            Unified fetch for memory, episode, entity, summary, file
+entity_get            Rich entity profile surface
+vault_query           Read-only vault query surface
+ops_status            Unified health dashboard
+gradient_score        Engram v2 compatibility alias over alignment_check
+```
+
+**Total: 24 agent-facing tools (+ 4 backward-compat aliases)**

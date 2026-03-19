@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import crypto from "node:crypto";
+import { ExpansionOrchestrator, distillForSubagent } from "../context/expansion.js";
 import type { LcmContextEngine } from "../context/engine.js";
 import {
   createDelegatedExpansionGrant,
@@ -24,6 +25,9 @@ import {
 const DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const GATEWAY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_ANSWER_TOKENS = 2_000;
+const DELEGATED_REPLY_POLL_ATTEMPTS = 5;
+const DELEGATED_REPLY_POLL_DELAY_MS = 250;
+const LOCAL_FALLBACK_MAX_DEPTH = 3;
 
 const LcmExpandQuerySchema = Type.Object({
   summaryIds: Type.Optional(
@@ -78,6 +82,9 @@ type ExpandQueryReply = {
 type SummaryCandidate = {
   summaryId: string;
   conversationId: number;
+  source: "explicit" | "query";
+  rank?: number;
+  createdAtMs?: number;
 };
 
 /**
@@ -209,6 +216,52 @@ function parseDelegatedExpandQueryReply(
 }
 
 /**
+ * Choose the dominant conversation from query-derived matches.
+ * Prefers the conversation with the most matches, then the best rank, then recency.
+ */
+function selectDominantQueryConversationId(candidates: SummaryCandidate[]): number | undefined {
+  const stats = new Map<
+    number,
+    { count: number; bestRank: number; latestCreatedAtMs: number }
+  >();
+  for (const candidate of candidates) {
+    if (candidate.source !== "query") {
+      continue;
+    }
+    const existing = stats.get(candidate.conversationId) ?? {
+      count: 0,
+      bestRank: Number.POSITIVE_INFINITY,
+      latestCreatedAtMs: 0,
+    };
+    existing.count += 1;
+    if (typeof candidate.rank === "number" && Number.isFinite(candidate.rank)) {
+      existing.bestRank = Math.min(existing.bestRank, candidate.rank);
+    }
+    if (typeof candidate.createdAtMs === "number" && Number.isFinite(candidate.createdAtMs)) {
+      existing.latestCreatedAtMs = Math.max(existing.latestCreatedAtMs, candidate.createdAtMs);
+    }
+    stats.set(candidate.conversationId, existing);
+  }
+
+  const ranked = Array.from(stats.entries()).sort((a, b) => {
+    const countDelta = b[1].count - a[1].count;
+    if (countDelta !== 0) {
+      return countDelta;
+    }
+    const rankDelta = a[1].bestRank - b[1].bestRank;
+    if (rankDelta !== 0) {
+      return rankDelta;
+    }
+    const recencyDelta = b[1].latestCreatedAtMs - a[1].latestCreatedAtMs;
+    if (recencyDelta !== 0) {
+      return recencyDelta;
+    }
+    return a[0] - b[0];
+  });
+  return ranked[0]?.[0];
+}
+
+/**
  * Resolve a single source conversation for delegated expansion.
  */
 function resolveSourceConversationId(params: {
@@ -228,6 +281,20 @@ function resolveSourceConversationId(params: {
     return params.scopedConversationId;
   }
 
+  const explicitConversationIds = Array.from(
+    new Set(
+      params.candidates
+        .filter((candidate) => candidate.source === "explicit")
+        .map((candidate) => candidate.conversationId),
+    ),
+  );
+  if (explicitConversationIds.length > 1) {
+    throw new Error("Provided summaryIds span multiple conversations. Provide conversationId.");
+  }
+  if (explicitConversationIds.length === 1 && typeof explicitConversationIds[0] === "number") {
+    return explicitConversationIds[0];
+  }
+
   const conversationIds = Array.from(
     new Set(params.candidates.map((candidate) => candidate.conversationId)),
   );
@@ -236,6 +303,10 @@ function resolveSourceConversationId(params: {
   }
 
   if (params.allConversations && conversationIds.length > 1) {
+    const dominantConversationId = selectDominantQueryConversationId(params.candidates);
+    if (typeof dominantConversationId === "number") {
+      return dominantConversationId;
+    }
     throw new Error(
       "Query matched summaries from multiple conversations. Provide conversationId or narrow the query.",
     );
@@ -266,6 +337,7 @@ async function resolveSummaryCandidates(params: {
     candidates.set(summaryId, {
       summaryId,
       conversationId: described.summary.conversationId,
+      source: "explicit",
     });
   }
 
@@ -280,11 +352,170 @@ async function resolveSummaryCandidates(params: {
       candidates.set(summary.summaryId, {
         summaryId: summary.summaryId,
         conversationId: summary.conversationId,
+        source: "query",
+        rank: typeof summary.rank === "number" ? summary.rank : undefined,
+        createdAtMs:
+          summary.createdAt instanceof Date ? summary.createdAt.getTime() : Date.now(),
       });
     }
   }
 
   return Array.from(candidates.values());
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractCompletionText(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .filter((entry): entry is { type?: unknown; text?: unknown } => {
+      return !!entry && typeof entry === "object";
+    })
+    .map((entry) => (entry.type === "text" && typeof entry.text === "string" ? entry.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+async function readDelegatedAssistantReply(params: {
+  deps: Pick<LcmDependencies, "callGateway" | "readLatestAssistantReply">;
+  childSessionKey: string;
+}): Promise<string | undefined> {
+  for (let attempt = 0; attempt < DELEGATED_REPLY_POLL_ATTEMPTS; attempt += 1) {
+    const replyPayload = (await params.deps.callGateway({
+      method: "sessions.get",
+      params: { key: params.childSessionKey, limit: 80 },
+      timeoutMs: GATEWAY_TIMEOUT_MS,
+    })) as { messages?: unknown[] };
+    const reply = params.deps.readLatestAssistantReply(
+      Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
+    );
+    if (reply?.trim()) {
+      return reply.trim();
+    }
+    if (attempt < DELEGATED_REPLY_POLL_ATTEMPTS - 1) {
+      await sleep(DELEGATED_REPLY_POLL_DELAY_MS * (attempt + 1));
+    }
+  }
+  return undefined;
+}
+
+function buildLocalFallbackAnswer(params: {
+  delegatedError?: string;
+  distilledContext: string;
+}): string {
+  const context = params.distilledContext.trim();
+  if (!context) {
+    return params.delegatedError
+      ? `Delegated expansion failed: ${params.delegatedError}`
+      : "Delegated expansion failed and no local context could be expanded.";
+  }
+  if (!params.delegatedError) {
+    return context;
+  }
+  return [`Delegated expansion failed: ${params.delegatedError}`, "", context].join("\n");
+}
+
+async function runLocalExpandQueryFallback(params: {
+  deps: Pick<LcmDependencies, "complete" | "resolveModel" | "getApiKey" | "log">;
+  lcm: LcmContextEngine;
+  summaryIds: string[];
+  sourceConversationId: number;
+  prompt: string;
+  maxTokens: number;
+  expansionTokenCap: number;
+  delegatedError?: string;
+}): Promise<ExpandQueryReply> {
+  const orchestrator = new ExpansionOrchestrator(params.lcm.getRetrieval());
+  const expansionResult = await orchestrator.expand({
+    summaryIds: params.summaryIds,
+    conversationId: params.sourceConversationId,
+    maxDepth: LOCAL_FALLBACK_MAX_DEPTH,
+    tokenCap: params.expansionTokenCap,
+    includeMessages: false,
+  });
+
+  const distilledContext = distillForSubagent(expansionResult);
+  const fallback: ExpandQueryReply = {
+    answer: buildLocalFallbackAnswer({
+      delegatedError: params.delegatedError,
+      distilledContext,
+    }),
+    citedIds: expansionResult.citedIds,
+    expandedSummaryCount: expansionResult.expansions.length,
+    totalSourceTokens: expansionResult.totalTokens,
+    truncated: expansionResult.truncated,
+  };
+
+  if (!distilledContext.trim()) {
+    return fallback;
+  }
+
+  try {
+    const { provider, model } = params.deps.resolveModel();
+    const apiKey = await params.deps.getApiKey(provider, model);
+    const completion = await params.deps.complete({
+      provider,
+      model,
+      apiKey,
+      system: [
+        "You answer questions using locally expanded LCM context.",
+        "Use only the supplied evidence. If it is insufficient, say so briefly.",
+        "Return ONLY JSON.",
+      ].join("\n"),
+      messages: [
+        {
+          role: "user",
+          content: [
+            "Question:",
+            params.prompt,
+            "",
+            "Expanded context:",
+            distilledContext,
+            "",
+            "Return ONLY JSON with this shape:",
+            "{",
+            '  "answer": "string",',
+            '  "citedIds": ["sum_xxx"],',
+            `  "expandedSummaryCount": ${expansionResult.expansions.length},`,
+            `  "totalSourceTokens": ${expansionResult.totalTokens},`,
+            `  "truncated": ${expansionResult.truncated ? "true" : "false"}`,
+            "}",
+          ].join("\n"),
+        },
+      ],
+      maxTokens: params.maxTokens,
+      temperature: 0.1,
+      reasoning: "low",
+    });
+    const rawReply = extractCompletionText(completion?.content);
+    if (!rawReply) {
+      return fallback;
+    }
+    const parsed = parseDelegatedExpandQueryReply(rawReply, expansionResult.expansions.length);
+    return {
+      answer: parsed.answer || fallback.answer,
+      citedIds: parsed.citedIds.length > 0 ? parsed.citedIds : fallback.citedIds,
+      expandedSummaryCount: Math.max(parsed.expandedSummaryCount, fallback.expandedSummaryCount),
+      totalSourceTokens:
+        parsed.totalSourceTokens > 0 ? parsed.totalSourceTokens : fallback.totalSourceTokens,
+      truncated: parsed.truncated || fallback.truncated,
+    };
+  } catch (error) {
+    params.deps.log.warn(
+      `[engram] lcm_expand_query local fallback completion failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return fallback;
+  }
 }
 
 export function createLcmExpandQueryTool(input: {
@@ -445,6 +676,34 @@ export function createLcmExpandQueryTool(input: {
           });
         }
 
+        const finishWithLocalFallback = async (delegatedError?: string) => {
+          input.deps.log.warn(
+            `[engram] lcm_expand_query delegated path failed; using local fallback: ${
+              delegatedError || "unknown delegated error"
+            }`,
+          );
+          const fallback = await runLocalExpandQueryFallback({
+            deps: input.deps,
+            lcm: input.lcm,
+            summaryIds,
+            sourceConversationId,
+            prompt,
+            maxTokens,
+            expansionTokenCap,
+            delegatedError,
+          });
+          return jsonResult({
+            answer: fallback.answer,
+            citedIds: fallback.citedIds,
+            sourceConversationId,
+            expandedSummaryCount: fallback.expandedSummaryCount,
+            totalSourceTokens: fallback.totalSourceTokens,
+            truncated: fallback.truncated,
+            fallbackUsed: true,
+            delegatedError,
+          });
+        };
+
         const requesterAgentId = input.deps.normalizeAgentId(
           input.deps.parseAgentSessionKey(callerSessionKey)?.agentId,
         );
@@ -500,9 +759,7 @@ export function createLcmExpandQueryTool(input: {
 
         const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
         if (!runId) {
-          return jsonResult({
-            error: "Delegated expansion did not return a runId.",
-          });
+          return await finishWithLocalFallback("Delegated expansion did not return a runId.");
         }
 
         const wait = (await input.deps.callGateway({
@@ -525,28 +782,31 @@ export function createLcmExpandQueryTool(input: {
             originSessionKey,
             runId,
           });
-          return jsonResult({
-            error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
-          });
+          return await finishWithLocalFallback(
+            "lcm_expand_query timed out waiting for delegated expansion (120s).",
+          );
         }
         if (status !== "ok") {
-          return jsonResult({
-            error:
-              typeof wait?.error === "string" && wait.error.trim()
-                ? wait.error
-                : "Delegated expansion query failed.",
-          });
+          return await finishWithLocalFallback(
+            typeof wait?.error === "string" && wait.error.trim()
+              ? wait.error
+              : "Delegated expansion query failed.",
+          );
         }
 
-        const replyPayload = (await input.deps.callGateway({
-          method: "sessions.get",
-          params: { key: childSessionKey, limit: 80 },
-          timeoutMs: GATEWAY_TIMEOUT_MS,
-        })) as { messages?: unknown[] };
-        const reply = input.deps.readLatestAssistantReply(
-          Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
-        );
+        const reply = await readDelegatedAssistantReply({
+          deps: input.deps,
+          childSessionKey,
+        });
+        if (!reply) {
+          return await finishWithLocalFallback(
+            "Delegated expansion completed without a readable assistant reply.",
+          );
+        }
         const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
+        if (!parsed.answer.trim()) {
+          return await finishWithLocalFallback("Delegated expansion returned an empty answer.");
+        }
         recordExpansionDelegationTelemetry({
           deps: input.deps,
           component: "lcm_expand_query",

@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
+import { ensureMemoryTables } from "../memory/memory-schema.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 
@@ -72,23 +73,7 @@ export function createMemoryWorldTool(input: { config: LcmConfig }): AnyAgentToo
           detail: err instanceof Error ? err.message : String(err),
         });
       }
-
-      db.exec(`CREATE TABLE IF NOT EXISTS memory_entities (
-        entity_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'person',
-        display_name TEXT NOT NULL, normalized_name TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active', confidence REAL NOT NULL DEFAULT 0.7,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS memory_current (
-        memory_id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT 'CONTEXT',
-        content TEXT NOT NULL, normalized TEXT NOT NULL DEFAULT '',
-        normalized_hash TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'manual',
-        source_agent TEXT, source_session TEXT, confidence REAL DEFAULT 0.75,
-        scope TEXT NOT NULL DEFAULT 'shared', status TEXT NOT NULL DEFAULT 'active',
-        value_score REAL, value_label TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        archived_at TEXT, last_reviewed_at TEXT, tags TEXT NOT NULL DEFAULT '[]',
-        superseded_by TEXT, content_time TEXT, valid_until TEXT
-      )`);
+      ensureMemoryTables(db);
 
       const where: string[] = ["status = 'active'"];
       const queryParams: (string | number | null)[] = [];

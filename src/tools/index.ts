@@ -5,7 +5,7 @@
  * Tool namespaces:
  *   context_*    — LCM conversation history navigation (DAG search, describe, expand)
  *   memory_*     — Long-term memory (capture, recall, search, query, world model, episodic)
- *   alignment_*  — Gradient alignment evaluation (P3 feature, stubs until integrated)
+ *   alignment_*  — Gradient alignment evaluation, status, and drift monitoring
  *
  * Backward compatibility: lcm_* names are also exported alongside context_* aliases.
  */
@@ -35,7 +35,7 @@ export { createMemoryRecallTool } from "../surface/memory-recall-tool.js";
 export { createMemorySearchTool } from "../surface/memory-search-tool.js";
 export { createMemoryWorldTool } from "../surface/memory-world-tool.js";
 
-// ── Alignment tools (Gradient — P3 stubs) ────────────────────────────────────
+// ── Alignment tools (Gradient) ────────────────────────────────────────────────
 export { createAlignmentCheckTool } from "../surface/alignment-tools.js";
 export { createAlignmentDriftTool } from "../surface/alignment-tools.js";
 export { createAlignmentStatusTool } from "../surface/alignment-tools.js";

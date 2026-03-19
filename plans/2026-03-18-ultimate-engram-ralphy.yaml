@@ -1,0 +1,182 @@
+tasks:
+  - title: Write canonical ultimate Engram contract spec
+    completed: true
+    parallel_group: 1
+    description: >
+      Create specs/ultimate-engram-contract.md as the single source of truth for
+      the plugin. Freeze the final public contract: tool names and aliases,
+      config schema, storage layers, migration guarantees, lifecycle hooks,
+      PARA/native file semantics, and rollout constraints. Base the product
+      contract on engram-v2 README/docs and the implementation base on the
+      current local repo. Include an explicit note that remote engram-v2 code is
+      not the implementation base.
+  - title: Converge config schema on the unified engram-v2 shape
+    completed: true
+    parallel_group: 2
+    description: >
+      Extend src/db/config.ts and openclaw.plugin.json to accept the nested
+      contract from engram-v2: compaction, capture, recall, largeFiles, native,
+      temporal, vault, gradient, obsidian, vector, and falkordb, while
+      preserving current flat keys and env vars as compatibility shims. Add
+      tests for legacy flat config, new nested config, and mixed config
+      precedence. Update help text and manifest defaults without breaking
+      current users.
+  - title: Add public contract test scaffolding for tools and config
+    completed: true
+    parallel_group: 2
+    description: >
+      Add contract tests that assert the promised public surface, not just
+      current implementation details. Create or extend tests to verify
+      registered tool names, alias behavior, core schemas, config compatibility,
+      and doctor-visible plugin health. The suite should fail if docs and
+      runtime drift again. Keep tests focused on stable public behavior rather
+      than internal implementation.
+  - title: Implement memory_get unified fetch tool
+    completed: true
+    parallel_group: 3
+    description: >
+      Add a new public memory_get tool that can fetch memory, episode, summary,
+      or file records by ID. Reuse existing local capabilities instead of
+      duplicating logic: memory tables for memory entries, episodic tables for
+      episodes, lcm_describe or equivalent for summary and file records.
+      Preserve memory_get_episode as a compatibility alias and add thorough
+      tests for each kind.
+  - title: Implement entity_get full profile tool
+    completed: true
+    parallel_group: 3
+    description: >
+      Expose the richer world-model detail already present internally through a
+      public entity_get tool. Support lookup by entityId or fuzzy name, and
+      return entity metadata, aliases, beliefs, episodes, open loops, and
+      syntheses. Reuse the world-model internals rather than the thin
+      memory_get_entity surface. Keep memory_get_entity working as a
+      compatibility path and add contract tests for both.
+  - title: Implement ops_status unified health dashboard
+    completed: true
+    parallel_group: 3
+    description: >
+      Add a public ops_status tool that aggregates health and counts from all
+      major layers: context/LCM, memory store, episodic store, namespaces, vault
+      freshness, gradient status, and database metadata. It should be the
+      single-call diagnostic surface described by engram-v2 docs. Reuse existing
+      stats where possible and add end-to-end tests that validate shape and
+      fallback behavior when optional layers are disabled.
+  - title: Implement gradient_score compatibility surface
+    completed: true
+    parallel_group: 3
+    description: >
+      Add gradient_score as the public compatibility tool for the remote
+      contract. Initially bridge it to the existing alignment layer and return
+      the remote documented shape. If the real evaluator is still unavailable,
+      return an explicit observe-only or not-available response with stable
+      fields, not a broken tool. Keep alignment_check, alignment_status, and
+      alignment_drift working.
+  - title: Implement vault_query as read-only agent-facing vault access
+    completed: true
+    parallel_group: 3
+    description: >
+      Add vault_query over the local vault or distillation layer so agents can
+      query distilled notes by category without mutating the vault. Use the
+      existing vault surface and future PARA distillation model as the backing
+      store. Return empty structured results when vault distillation is
+      disabled. Keep vault generation and maintenance internal; expose
+      query-only behavior to agents.
+  - title: Upgrade memory_query into a strategy-aware recall orchestrator
+    completed: true
+    parallel_group: 4
+    description: >
+      Rework memory_query so it supports the remote contract strategies: auto,
+      quick_context, entity_brief, relationship, timeline, verification.
+      Preserve the current afterDate and beforeDate behavior for backward
+      compatibility. Implement it as an orchestrator over current retrieval,
+      world-model, episodic, and synthesis layers rather than a second search
+      tool. Add tests for each strategy and mixed legacy/new parameter usage.
+  - title: Upgrade memory_search ranking and recall budgeting
+    completed: true
+    parallel_group: 4
+    description: >
+      Extend memory_search to support the richer Gigabrain and engram-v2
+      behavior: topK, minScore, maxTokens budgeting, archive fallback, scope and
+      type filtering, and entity-lock style boosts. Preserve the current FTS and
+      LIKE fallback retrieval core, but add a stronger ranking/orchestration
+      layer and explicit tests for ranking, fallback, archive search, and token
+      budgeting.
+  - title: Implement capture hooks and memory_note pipeline
+    completed: true
+    parallel_group: 4
+    description: >
+      Add real capture lifecycle wiring for post-turn capture and pre-compaction
+      extraction. Implement optional <memory_note> parsing, quality gate
+      thresholds, dedupe bands, queue-on-model-unavailable, provenance capture,
+      and safe fallbacks. This should absorb the Gigabrain capture model into
+      the local plugin lifecycle rather than requiring manual memory_add-only
+      workflows.
+  - title: Implement PARA and native file sync layer
+    completed: true
+    parallel_group: 5
+    description: >
+      Add first-class sync for MEMORY.md, memory/YYYY-MM-DD*.md daily notes, and
+      PARA-style life/ folders covering projects, areas, resources, and
+      archives. Persist provenance in SQLite (source_layer, source_path,
+      source_line), support idempotent re-indexing, and define conflict rules
+      between file-sourced facts and registry-sourced facts. Build this on the
+      local repo rather than bolting on a separate external memory system.
+  - title: Implement background episodic ingestion jobs
+    completed: true
+    parallel_group: 5
+    description: >
+      Turn the current episodic stubs into a real scheduler and job system.
+      Implement polling, chunked ingestion, durable job state, deduplication,
+      and working memory_ingest_now and memory_job_status tools. Reuse the
+      existing SQLite base and keep it safe under long-running gateway
+      operation. Add tests for queue state, retries, and manual trigger
+      behavior.
+  - title: Implement namespace isolation and memory_list_agents
+    completed: true
+    parallel_group: 5
+    description: >
+      Add proper agent namespace support so multiple agents can share one
+      database without smashing each other's operational state. Implement
+      agentNamespace-aware writes and reads where required, plus a real
+      memory_list_agents tool. Keep existing shared defaults for single-agent
+      setups and add compatibility tests for default/shared namespace behavior.
+  - title: Wire world-model rebuilds from all memory sources
+    completed: true
+    parallel_group: 5
+    description: >
+      Ensure capture events, native/PARA sync, episodic ingestion, and manual
+      memory_add flows all feed the same world-model rebuild pipeline. The world
+      model should produce consistent beliefs, episodes, open loops,
+      contradictions, and syntheses regardless of source. Add integration tests
+      proving that file-backed and registry-backed memories surface correctly
+      through entity_get and recall tools.
+  - title: Build migration and import tooling across legacy systems
+    completed: true
+    parallel_group: 6
+    description: >
+      Add migration and import paths for lossless-claw, gigabrain, openstinger,
+      stingervault, and PARA file structures. Support dry-run, backup,
+      provenance tagging, and repeatable imports. Extend the existing CLI and
+      docs so users can merge existing stores into one unified plugin without
+      manual SQL work. Add fixture-driven tests for representative exports from
+      each legacy system.
+  - title: Update docs and system prompts to the final public surface
+    completed: true
+    parallel_group: 6
+    description: >
+      Update README, tool inventory, migration guide, architecture docs, and
+      system-prompt generation so they describe the actual final runtime:
+      canonical public tools, compatibility aliases, config shape, PARA/native
+      sync, vault query, gradient score, and ops status. Remove known doc drift
+      and add a concise operator guide showing how to run the plugin as the
+      unified memory system for OpenClaw.
+  - title: Run full verification matrix and produce rollout checklist
+    completed: true
+    parallel_group: 7
+    description: >
+      Run the complete verification matrix: targeted tests, full npm test,
+      doctor, gateway restart, gateway status, and end-to-end manual checks for
+      the main public tools. Produce a rollout checklist documenting remaining
+      risks, optional layers that are still stubbed if any, migration commands,
+      and rollback steps. The task is only complete when the plugin can credibly
+      replace the multi-plugin stack with one coherent public contract.

@@ -49,6 +49,12 @@ export interface CompactionConfig {
   maxRounds: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
+  /** Best-effort callback invoked before raw messages are compacted into a summary. */
+  captureMessagesBeforeCompaction?: (params: {
+    conversationId: number;
+    sessionId: string;
+    messages: PreCompactionCaptureMessage[];
+  }) => Promise<void> | void;
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback";
@@ -76,6 +82,15 @@ type CondensedChunkSelection = {
 type CondensedPhaseCandidate = {
   targetDepth: number;
   chunk: CondensedChunkSelection;
+};
+
+export type PreCompactionCaptureMessage = {
+  messageId: number;
+  seq: number;
+  role: string;
+  content: string;
+  createdAt: Date;
+  tokenCount: number;
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1006,8 +1021,7 @@ export class CompactionEngine {
     previousSummaryContent?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
-      [];
+    const messageContents: PreCompactionCaptureMessage[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -1016,10 +1030,30 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
+          seq: msg.seq,
+          role: msg.role,
           content: msg.content,
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });
+      }
+    }
+
+    if (
+      typeof this.config.captureMessagesBeforeCompaction === "function" &&
+      messageContents.length > 0
+    ) {
+      try {
+        const conversation = await this.conversationStore.getConversation(conversationId);
+        if (conversation) {
+          await this.config.captureMessagesBeforeCompaction({
+            conversationId,
+            sessionId: conversation.sessionId,
+            messages: messageContents,
+          });
+        }
+      } catch {
+        // Durable capture must not block compaction progress.
       }
     }
 

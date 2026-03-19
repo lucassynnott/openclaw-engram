@@ -6,6 +6,9 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.gradientEnabled).toBe(true);
+    expect(config.gradientObserveOnly).toBe(true);
+    expect(config.vectorBackend).toBe("sqlite_vec");
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(32);
     expect(config.incrementalMaxDepth).toBe(0);
@@ -26,8 +29,14 @@ describe("resolveLcmConfig", () => {
       autocompactDisabled: true,
       pruneHeartbeatOk: true,
       enabled: false,
+      gradient: {
+        enabled: false,
+        observeOnly: false,
+      },
     });
     expect(config.enabled).toBe(false);
+    expect(config.gradientEnabled).toBe(false);
+    expect(config.gradientObserveOnly).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
     expect(config.incrementalMaxDepth).toBe(-1);
@@ -116,6 +125,29 @@ describe("resolveLcmConfig", () => {
       { databasePath: "/plugin/path/lcm.db" },
     );
     expect(config.databasePath).toBe("/env/path/lcm.db");
+  });
+
+  it("prefers ENGRAM_* env vars over legacy LCM_* aliases", () => {
+    const config = resolveLcmConfig(
+      {
+        ENGRAM_DATABASE_PATH: "/env/path/engram.db",
+        LCM_DATABASE_PATH: "/env/path/lcm.db",
+        ENGRAM_COMPACTION_CONDENSED_MIN_FANOUT_HARD: "5",
+        LCM_CONDENSED_MIN_FANOUT_HARD: "2",
+        ENGRAM_MAX_EXPAND_TOKENS: "8192",
+        LCM_MAX_EXPAND_TOKENS: "4000",
+        ENGRAM_PRUNE_HEARTBEAT_OK: "true",
+        LCM_PRUNE_HEARTBEAT_OK: "false",
+        ENGRAM_OBSIDIAN_HOME_NOTE_NAME: "Launchpad",
+        LCM_VAULT_HOME_NOTE_NAME: "Home",
+      } as NodeJS.ProcessEnv,
+      { databasePath: "/plugin/path/lcm.db" },
+    );
+    expect(config.databasePath).toBe("/env/path/engram.db");
+    expect(config.condensedMinFanoutHard).toBe(5);
+    expect(config.maxExpandTokens).toBe(8192);
+    expect(config.pruneHeartbeatOk).toBe(true);
+    expect(config.vaultHomeNoteName).toBe("Launchpad");
   });
 
   it("accepts manifest largeFileThresholdTokens from plugin config", () => {

@@ -1,4 +1,4 @@
-import type { ContextEngine } from "openclaw/plugin-sdk";
+import type { ContextEngineMessage } from "../integration/openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "../graph/transcript-repair.js";
 import type {
   ConversationStore,
@@ -7,7 +7,7 @@ import type {
 } from "../memory/store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "../memory/store/summary-store.js";
 
-type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AgentMessage = ContextEngineMessage;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 

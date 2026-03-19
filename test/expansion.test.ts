@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import type { ExpansionOrchestrator } from "../src/context/expansion.js";
 import { buildExpansionToolDefinition } from "../src/context/expansion.js";
+import { makeTestConfig } from "./test-config.js";
 
-const BASE_CONFIG: LcmConfig = {
-  enabled: true,
+const BASE_CONFIG: LcmConfig = makeTestConfig({
   databasePath: ":memory:",
   contextThreshold: 0.75,
   freshTailCount: 8,
@@ -22,7 +22,7 @@ const BASE_CONFIG: LcmConfig = {
   autocompactDisabled: false,
   timezone: "UTC",
   pruneHeartbeatOk: false,
-};
+});
 
 function makeExpansionResult() {
   return {

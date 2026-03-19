@@ -209,18 +209,69 @@ describe("createLcmExpandTool expansion limits", () => {
     );
   });
 
-  it("rejects delegated sub-agent expansion when no grant is propagated", async () => {
+  it("allows delegated sub-agent expansion without a propagated grant when conversation scope is explicit", async () => {
     const mockRetrieval = makeMockRetrieval();
+    mockRetrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 7 },
+    });
+    mockRetrieval.expand.mockResolvedValue({
+      children: [],
+      messages: [],
+      estimatedTokens: 20,
+      truncated: false,
+    });
 
     const tool = createLcmExpandTool({
       deps: makeDeps(),
       lcm: makeEngine({ retrieval: mockRetrieval }),
       sessionId: "agent:main:subagent:no-grant",
     });
-    const result = await tool.execute("call-missing-grant", { summaryIds: ["sum_a"] });
+    const result = await tool.execute("call-missing-grant", {
+      summaryIds: ["sum_a"],
+      conversationId: 7,
+    });
 
     expect(result.details).toMatchObject({
-      error: expect.stringContaining("requires a valid grant"),
+      expansionCount: 1,
+      totalTokens: 20,
+      truncated: false,
+    });
+    expect(mockRetrieval.expand).toHaveBeenCalledOnce();
+  });
+
+  it("rejects delegated query expansion without a grant when matches span multiple conversations", async () => {
+    const mockRetrieval = makeMockRetrieval();
+    mockRetrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_a",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "first",
+        },
+        {
+          summaryId: "sum_b",
+          conversationId: 8,
+          kind: "leaf",
+          snippet: "second",
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:no-grant-query",
+    });
+    const result = await tool.execute("call-missing-grant-query", {
+      query: "ambiguous",
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("requires a single conversation scope"),
     });
     expect(mockRetrieval.expand).not.toHaveBeenCalled();
   });

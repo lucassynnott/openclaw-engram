@@ -95,11 +95,10 @@ function makeSummaryStoreMock(overrides: Record<string, unknown> = {}) {
     // Helpers to seed data in tests
     _addSummary(s: { summaryId: string; conversationId: number; kind: "leaf" | "condensed"; depth?: number; tokenCount?: number }) {
       summaries.push({
-        kind: "leaf",
-        depth: s.kind === "leaf" ? 0 : 1,
-        tokenCount: 10,
         content: "",
         ...s,
+        depth: s.depth ?? (s.kind === "leaf" ? 0 : 1),
+        tokenCount: s.tokenCount ?? 10,
       });
     },
     _addContextItem(ci: {

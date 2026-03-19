@@ -769,7 +769,7 @@ describe("LCM integration: ingest -> assemble", () => {
 
     // The summary should appear as a user message with an XML summary wrapper.
     const summaryMsg = result.messages.find((m) =>
-      m.content.includes('<summary id="sum_test_001"'),
+      extractMessageText(m.content).includes('<summary id="sum_test_001"'),
     );
     expect(summaryMsg).toBeDefined();
     expect(summaryMsg!.role).toBe("user");
@@ -1496,7 +1496,8 @@ describe("LCM integration: compaction", () => {
     });
 
     expect(result.actionTaken).toBe(true);
-    const firstSourceText = summarize.mock.calls[0]?.[0] as string;
+    const firstCall = summarize.mock.calls as unknown as Array<[unknown]>;
+    const firstSourceText = String(firstCall[0]?.[0] ?? "");
     expect(firstSourceText).toMatch(
       /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC - \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]/,
     );
@@ -2438,7 +2439,9 @@ describe("LCM integration: full round-trip", () => {
     expect(assembleResult.stats.rawMessageCount).toBeGreaterThan(0);
 
     // At least one assembled message should contain summary content
-    const hasSummary = assembleResult.messages.some((m) => m.content.includes("<summary id="));
+    const hasSummary = assembleResult.messages.some((m) =>
+      extractMessageText(m.content).includes("<summary id="),
+    );
     expect(hasSummary).toBe(true);
 
     // Fresh tail messages (last 4) should be present
@@ -2559,9 +2562,10 @@ describe("LCM integration: full round-trip", () => {
     let sawSummary = false;
     let sawFreshAfterSummary = false;
     for (const msg of result.messages) {
-      if (msg.content.includes("<summary id=")) {
+      const content = extractMessageText(msg.content);
+      if (content.includes("<summary id=")) {
         sawSummary = true;
-      } else if (sawSummary && msg.content.includes("Sequential message")) {
+      } else if (sawSummary && content.includes("Sequential message")) {
         sawFreshAfterSummary = true;
       }
     }

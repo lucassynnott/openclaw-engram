@@ -1,12 +1,9 @@
-import type { AnyAgentTool as OpenClawAnyAgentTool } from "openclaw/plugin-sdk";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 
-export type AnyAgentTool = OpenClawAnyAgentTool;
+export type AnyAgentTool<TDetails = any> = AgentTool<any, TDetails>;
 
 /** Render structured payloads as deterministic text tool results. */
-export function jsonResult(payload: unknown): {
-  content: Array<{ type: "text"; text: string }>;
-  details: unknown;
-} {
+export function jsonResult<T>(payload: T): AgentToolResult<T> {
   return {
     content: [
       {

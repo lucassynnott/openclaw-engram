@@ -1,12 +1,13 @@
 {
   "id": "engram",
+  "kind": "memory",
   "displayName": "Engram",
   "description": "Unified memory and context engine for OpenClaw — DAG-based summarization, retrieval, and sub-agent expansion",
   "version": "0.1.0",
   "uiHints": {
     "enabled": {
       "label": "Enabled",
-      "help": "Enable or disable the LCM context engine (disabling falls back to OpenClaw built-in compaction)"
+      "help": "Enable or disable the Engram memory and context engine (disabling falls back to OpenClaw built-in compaction)"
     },
     "contextThreshold": {
       "label": "Context Threshold",
@@ -50,7 +51,11 @@
     },
     "dbPath": {
       "label": "Database Path",
-      "help": "Path to the LCM SQLite database file. Default: ~/.openclaw/lcm.db"
+      "help": "Path to the Engram SQLite database file. Default: ~/.openclaw/lcm.db for compatibility; ENGRAM_DATABASE_PATH is preferred for new installs."
+    },
+    "databasePath": {
+      "label": "Database Path",
+      "help": "Canonical Engram database path. Default: ~/.openclaw/lcm.db for compatibility; ENGRAM_DATABASE_PATH is preferred for new installs."
     },
     "largeFileThresholdTokens": {
       "label": "Large File Threshold (tokens)",
@@ -119,6 +124,22 @@
     "obsidianExportDiagnostics": {
       "label": "Export Diagnostics",
       "help": "When true, export diagnostic views (summary depth distribution, raw leaf list). Default: false"
+    },
+    "vector.backend": {
+      "label": "Vector Backend",
+      "help": "Vector retrieval backend. Use sqlite_vec for local-first native search, falkordb for external graph/vector mirroring, or none to disable vector recall."
+    },
+    "vector.embeddingProvider": {
+      "label": "Embedding Provider",
+      "help": "Preferred embedding provider for vector indexing. Engram uses OpenAI-compatible embedding APIs and falls back to local dense vectors if unavailable."
+    },
+    "vector.embeddingModel": {
+      "label": "Embedding Model",
+      "help": "Embedding model name used for provider-backed vector indexing."
+    },
+    "falkordb.enabled": {
+      "label": "FalkorDB Mirror",
+      "help": "Enable the optional FalkorDB vector mirror and nearest-neighbor query path."
     }
   },
   "configSchema": {
@@ -128,6 +149,13 @@
       "enabled": {
         "type": "boolean",
         "default": true
+      },
+      "databasePath": {
+        "type": "string"
+      },
+      "agentNamespace": {
+        "type": "string",
+        "default": "default"
       },
       "contextThreshold": {
         "type": "number",
@@ -246,6 +274,158 @@
       "obsidianExportDiagnostics": {
         "type": "boolean",
         "default": false
+      },
+      "compaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "contextThreshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.75 },
+          "freshTailCount": { "type": "integer", "minimum": 1, "default": 32 },
+          "leafMinFanout": { "type": "integer", "minimum": 2, "default": 8 },
+          "condensedMinFanout": { "type": "integer", "minimum": 2, "default": 4 },
+          "leafChunkTokens": { "type": "integer", "minimum": 1000, "default": 20000 },
+          "leafTargetTokens": { "type": "integer", "minimum": 100, "default": 1200 },
+          "condensedTargetTokens": { "type": "integer", "minimum": 100, "default": 2000 },
+          "incrementalMaxDepth": { "type": "integer", "minimum": -1, "default": 0 },
+          "autocompactDisabled": { "type": "boolean", "default": false },
+          "maxRounds": { "type": "integer", "minimum": 1, "default": 10 },
+          "timezone": { "type": "string", "default": "UTC" }
+        }
+      },
+      "capture": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "requireMemoryNote": { "type": "boolean", "default": true },
+          "minConfidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 },
+          "minContentChars": { "type": "integer", "minimum": 1, "default": 25 },
+          "dedupeAuto": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.92 },
+          "dedupeReview": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 },
+          "queueOnModelUnavailable": { "type": "boolean", "default": true },
+          "preCompactionExtraction": { "type": "boolean", "default": true }
+        }
+      },
+      "recall": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topK": { "type": "integer", "minimum": 1, "default": 8 },
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.45 },
+          "maxTokens": { "type": "integer", "minimum": 1, "default": 1200 },
+          "archiveFallback": { "type": "boolean", "default": true },
+          "defaultStrategy": {
+            "type": "string",
+            "enum": ["auto", "quick_context", "entity_brief", "relationship", "timeline", "verification"],
+            "default": "auto"
+          },
+          "entityLockEnabled": { "type": "boolean", "default": true }
+        }
+      },
+      "largeFiles": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tokenThreshold": { "type": "integer", "minimum": 1000, "default": 25000 },
+          "summaryProvider": { "type": "string" },
+          "summaryModel": { "type": "string" }
+        }
+      },
+      "native": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "memoryMdPath": { "type": "string", "default": "MEMORY.md" },
+          "dailyNotesGlob": { "type": "string", "default": "memory/????-??-??*.md" },
+          "syncMode": {
+            "type": "string",
+            "enum": ["hybrid", "registry_only", "native_only"],
+            "default": "hybrid"
+          },
+          "maxChunkChars": { "type": "integer", "minimum": 1, "default": 900 }
+        }
+      },
+      "temporal": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "entityExtraction": { "type": "boolean", "default": true },
+          "episodeIngestion": { "type": "boolean", "default": true },
+          "pollIntervalSeconds": { "type": "integer", "minimum": 1, "default": 5 },
+          "chunkSize": { "type": "integer", "minimum": 1, "default": 10 },
+          "deduplication": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "tokenOverlapMin": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4 },
+              "lshThreshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+              "llmConfidenceMin": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 }
+            }
+          }
+        }
+      },
+      "vault": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "distillationEnabled": { "type": "boolean", "default": false },
+          "classificationIntervalSeconds": { "type": "integer", "minimum": 1, "default": 300 },
+          "decayDays": { "type": "integer", "minimum": 1, "default": 90 },
+          "episodesPerBatch": { "type": "integer", "minimum": 1, "default": 20 }
+        }
+      },
+      "gradient": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "observeOnly": { "type": "boolean", "default": true },
+          "driftWindowSize": { "type": "integer", "minimum": 1, "default": 20 },
+          "driftAlertThreshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 },
+          "consecutiveFlagLimit": { "type": "integer", "minimum": 1, "default": 5 }
+        }
+      },
+      "obsidian": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "path": { "type": "string", "default": "" },
+          "subdir": { "type": "string", "default": "Engram" },
+          "mode": { "type": "string", "enum": ["curated", "diagnostic"], "default": "curated" },
+          "manualFolders": { "type": "string", "default": "Inbox,Manual" },
+          "clean": { "type": "boolean", "default": true },
+          "reportsEnabled": { "type": "boolean", "default": true },
+          "entityPages": { "type": "boolean", "default": false }
+        }
+      },
+      "falkordb": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "host": { "type": "string", "default": "localhost" },
+          "port": { "type": "integer", "minimum": 1, "default": 6379 },
+          "password": { "type": "string", "default": "" },
+          "temporalGraph": { "type": "string", "default": "engram_temporal" },
+          "knowledgeGraph": { "type": "string", "default": "engram_knowledge" }
+        }
+      },
+      "vector": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "backend": {
+            "type": "string",
+            "enum": ["none", "sqlite_vec", "falkordb"],
+            "default": "sqlite_vec"
+          },
+          "dimensions": { "type": "integer", "minimum": 1, "default": 1536 },
+          "embeddingModel": { "type": "string", "default": "text-embedding-3-small" },
+          "embeddingProvider": { "type": "string", "default": "openai" }
+        }
       }
     }
   }

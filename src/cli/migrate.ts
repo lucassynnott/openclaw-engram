@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, copyFileSync, mkdirSync, renameSync, statSync, readdirSync } from "node:fs";
+import { existsSync, copyFileSync, mkdirSync, renameSync, statSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { getLcmConnection, closeLcmConnection } from "../db/connection.js";
@@ -638,20 +638,195 @@ function importOpenStingerFromSqlite(
   return { episodesImported, entitiesImported, errors };
 }
 
+function collectJsonExportRecords(jsonPath: string): Array<Record<string, unknown>> {
+  const stats = statSync(jsonPath);
+  const records: Array<Record<string, unknown>> = [];
+
+  const appendPayload = (payload: unknown): void => {
+    if (Array.isArray(payload)) {
+      for (const entry of payload) {
+        if (entry && typeof entry === "object") {
+          records.push(entry as Record<string, unknown>);
+        }
+      }
+      return;
+    }
+    if (payload && typeof payload === "object") {
+      const record = payload as Record<string, unknown>;
+      const nestedArrays = ["episodes", "entities", "relationships", "vaultEntries", "vault_entries"];
+      let appendedNested = false;
+      for (const key of nestedArrays) {
+        if (Array.isArray(record[key])) {
+          appendPayload(record[key]);
+          appendedNested = true;
+        }
+      }
+      if (!appendedNested) {
+        records.push(record);
+      }
+    }
+  };
+
+  const appendFile = (filePath: string): void => {
+    const raw = readFileSync(filePath, "utf8");
+    if (filePath.endsWith(".jsonl")) {
+      for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        appendPayload(JSON.parse(trimmed));
+      }
+      return;
+    }
+    appendPayload(JSON.parse(raw));
+  };
+
+  if (stats.isDirectory()) {
+    const entries = readdirSync(jsonPath)
+      .map((entry) => join(jsonPath, entry))
+      .filter((entry) => statSync(entry).isFile() && /\.(json|jsonl)$/i.test(entry));
+    for (const filePath of entries) {
+      appendFile(filePath);
+    }
+    return records;
+  }
+
+  appendFile(jsonPath);
+  return records;
+}
+
 function importOpenStingerFromJson(
-  _targetDb: DatabaseSync,
-  _jsonPath: string,
+  targetDb: DatabaseSync,
+  jsonPath: string,
 ): {
   episodesImported: number;
   entitiesImported: number;
   errors: string[];
 } {
-  // TODO: Implement JSON export import from FalkorDB
-  // This would parse JSON files exported from FalkorDB
+  const errors: string[] = [];
+  let episodesImported = 0;
+  let entitiesImported = 0;
+
+  const insertEpisode = targetDb.prepare(`
+    INSERT INTO openstinger_episodes (
+      episode_id, session_id, conversation_id, episode_type, content,
+      valid_time, transaction_time, token_count, importance, is_deleted,
+      parent_episode_id, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(episode_id) DO UPDATE SET
+      transaction_time = excluded.transaction_time,
+      metadata = excluded.metadata
+  `);
+  const insertEntity = targetDb.prepare(`
+    INSERT INTO openstinger_entities (
+      entity_id, entity_type, name, description, properties,
+      created_at, updated_at, source_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(entity_id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      source_count = openstinger_entities.source_count + excluded.source_count
+  `);
+  const insertRelationship = targetDb.prepare(`
+    INSERT INTO openstinger_relationships (
+      relationship_id, from_entity_id, to_entity_id, relationship_type,
+      strength, evidence, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(relationship_id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      evidence = excluded.evidence
+  `);
+  const insertVaultEntry = targetDb.prepare(`
+    INSERT INTO openstinger_vault_entries (
+      entry_id, category, key, value, confidence, source_episodes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(entry_id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      value = excluded.value
+  `);
+
+  try {
+    const records = collectJsonExportRecords(jsonPath);
+    for (const record of records) {
+      try {
+        if (typeof record.episode_id === "string" || typeof record.session_id === "string") {
+          insertEpisode.run(
+            String(record.episode_id || `episode:${episodesImported + 1}`),
+            String(record.session_id || "unknown-session"),
+            typeof record.conversation_id === "number" ? record.conversation_id : null,
+            String(record.episode_type || "turn"),
+            String(record.content || record.summary || ""),
+            String(record.valid_time || record.created_at || new Date().toISOString()),
+            String(record.transaction_time || record.updated_at || new Date().toISOString()),
+            Number(record.token_count || 0),
+            Number(record.importance || 0.5),
+            Number(record.is_deleted || 0),
+            typeof record.parent_episode_id === "string" ? record.parent_episode_id : null,
+            JSON.stringify(record),
+          );
+          episodesImported += 1;
+          continue;
+        }
+
+        if (typeof record.entity_id === "string" || typeof record.name === "string") {
+          insertEntity.run(
+            String(record.entity_id || `entity:${entitiesImported + 1}`),
+            String(record.entity_type || "concept"),
+            String(record.name || record.display_name || "Unnamed entity"),
+            typeof record.description === "string" ? record.description : null,
+            JSON.stringify(record.properties ?? record),
+            String(record.created_at || new Date().toISOString()),
+            String(record.updated_at || record.created_at || new Date().toISOString()),
+            Math.max(1, Number(record.source_count || 1)),
+          );
+          entitiesImported += 1;
+          continue;
+        }
+
+        if (
+          (typeof record.relationship_id === "string" || (record.from_entity_id && record.to_entity_id))
+          && typeof record.from_entity_id === "string"
+          && typeof record.to_entity_id === "string"
+        ) {
+          insertRelationship.run(
+            String(record.relationship_id || `${record.from_entity_id}:${record.to_entity_id}:${record.relationship_type || "related_to"}`),
+            record.from_entity_id,
+            record.to_entity_id,
+            String(record.relationship_type || "related_to"),
+            Number(record.strength || 1),
+            typeof record.evidence === "string" ? record.evidence : JSON.stringify(record.evidence ?? []),
+            String(record.created_at || new Date().toISOString()),
+            String(record.updated_at || record.created_at || new Date().toISOString()),
+          );
+          continue;
+        }
+
+        if (
+          typeof record.entry_id === "string"
+          || (typeof record.category === "string" && typeof record.key === "string")
+        ) {
+          insertVaultEntry.run(
+            String(record.entry_id || `${record.category}:${record.key}`),
+            String(record.category || "beliefs"),
+            String(record.key || "value"),
+            String(record.value || record.content || ""),
+            Number(record.confidence || 1),
+            JSON.stringify(record.source_episodes ?? []),
+            String(record.created_at || new Date().toISOString()),
+            String(record.updated_at || record.created_at || new Date().toISOString()),
+          );
+          continue;
+        }
+      } catch (err) {
+        errors.push(`Failed to import OpenStinger JSON record: ${err}`);
+      }
+    }
+  } catch (err) {
+    errors.push(`Failed to import OpenStinger JSON data: ${err}`);
+  }
+
   return {
-    episodesImported: 0,
-    entitiesImported: 0,
-    errors: ["JSON import from FalkorDB not yet implemented. Please export to SQLite first."],
+    episodesImported,
+    entitiesImported,
+    errors,
   };
 }
 

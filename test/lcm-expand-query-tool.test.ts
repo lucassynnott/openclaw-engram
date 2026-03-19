@@ -13,6 +13,35 @@ import {
 } from "../src/surface/lcm-expansion-recursion-guard.js";
 import { createLcmExpandQueryTool } from "../src/surface/lcm-expand-query-tool.js";
 import type { LcmDependencies } from "../src/types.js";
+import { makeTestConfig } from "./test-config.js";
+
+type MockGrepResult = {
+  messages: unknown[];
+  summaries: unknown[];
+  totalMatches: number;
+};
+
+type MockDescribeResult = {
+  type: "summary" | "file";
+  summary?: {
+    conversationId: number;
+  };
+  file?: {
+    conversationId: number;
+  };
+} | null;
+
+type MockExpandResult = {
+  children: Array<{
+    summaryId: string;
+    kind: string;
+    content: string;
+    tokenCount: number;
+  }>;
+  messages: unknown[];
+  estimatedTokens: number;
+  truncated: boolean;
+};
 
 const callGatewayMock = vi.fn();
 
@@ -58,8 +87,7 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 
 function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
   return {
-    config: {
-      enabled: true,
+    config: makeTestConfig({
       databasePath: ":memory:",
       contextThreshold: 0.75,
       freshTailCount: 8,
@@ -77,7 +105,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
-    },
+    }),
     complete: vi.fn(),
     callGateway: (params: { method: string; params?: Record<string, unknown> }) =>
       callGatewayMock(params),
@@ -103,9 +131,22 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
 }
 
 function makeRetrieval() {
+  const grep = vi.fn(async (): Promise<MockGrepResult> => ({
+    messages: [],
+    summaries: [],
+    totalMatches: 0,
+  }));
+  const describe = vi.fn(async (): Promise<MockDescribeResult> => null);
+  const expand = vi.fn(async (): Promise<MockExpandResult> => ({
+    children: [],
+    messages: [],
+    estimatedTokens: 0,
+    truncated: false,
+  }));
   return {
-    grep: vi.fn(),
-    describe: vi.fn(),
+    grep,
+    describe,
+    expand,
   };
 }
 
@@ -295,7 +336,9 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     expect(result.details).toMatchObject({
-      error: expect.stringContaining("timed out"),
+      sourceConversationId: 42,
+      fallbackUsed: true,
+      delegatedError: expect.stringContaining("timed out"),
     });
 
     const methods = callGatewayMock.mock.calls.map(
@@ -354,6 +397,88 @@ describe("createLcmExpandQueryTool", () => {
     expect(methods).toContain("sessions.delete");
     expect(delegatedSessionKey).not.toBe("");
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+  });
+
+  it("falls back to local expansion when delegated execution fails", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    retrieval.expand.mockResolvedValue({
+      children: [
+        {
+          summaryId: "sum_child",
+          kind: "leaf",
+          content: "The deploy introduced stale token handling.",
+          tokenCount: 80,
+        },
+      ],
+      messages: [],
+      estimatedTokens: 80,
+      truncated: false,
+    });
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        return { runId: "run-fallback" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "error", error: "subagent runtime not available" };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const complete = vi.fn(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            answer: "The deploy regressed token handling in the memory path.",
+            citedIds: ["sum_a", "sum_child"],
+            expandedSummaryCount: 1,
+            totalSourceTokens: 80,
+            truncated: false,
+          }),
+        },
+      ],
+    }));
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps({ complete }),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-fallback", {
+      summaryIds: ["sum_a"],
+      prompt: "What caused the regression?",
+      conversationId: 42,
+    });
+
+    expect(retrieval.expand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summaryId: "sum_a",
+        depth: 3,
+        includeMessages: false,
+        tokenCap: 120,
+      }),
+    );
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(result.details).toMatchObject({
+      answer: "The deploy regressed token handling in the memory path.",
+      citedIds: ["sum_a", "sum_child"],
+      sourceConversationId: 42,
+      expandedSummaryCount: 1,
+      totalSourceTokens: 80,
+      truncated: false,
+      fallbackUsed: true,
+      delegatedError: "subagent runtime not available",
+    });
   });
 
   it("greps summaries first when query is provided", async () => {
@@ -447,6 +572,110 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationId: 7,
       expandedSummaryCount: 2,
       citedIds: ["sum_x", "sum_y"],
+    });
+  });
+
+  it("auto-selects the dominant conversation for allConversations query matches", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_a",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "a",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+          rank: 2,
+        },
+        {
+          summaryId: "sum_b",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "b",
+          createdAt: new Date("2026-01-01T00:02:00.000Z"),
+          rank: 1,
+        },
+        {
+          summaryId: "sum_c",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "c",
+          createdAt: new Date("2026-01-01T00:03:00.000Z"),
+          rank: 0,
+        },
+      ],
+      totalMatches: 3,
+    });
+
+    let delegatedSessionKey = "";
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        delegatedSessionKey = String(request.params?.sessionKey ?? "");
+        return { runId: "run-dominant-conv" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Conversation 7 contains the dominant evidence.",
+                    citedIds: ["sum_a", "sum_b"],
+                    expandedSummaryCount: 2,
+                    totalSourceTokens: 180,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-dominant-conv", {
+      query: "deploy regression",
+      prompt: "What regressed?",
+      allConversations: true,
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: "deploy regression",
+        mode: "full_text",
+        scope: "summaries",
+        conversationId: undefined,
+      }),
+    );
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+    const rawMessage = agentCall?.params?.message;
+    expect(typeof rawMessage).toBe("string");
+    expect(String(rawMessage)).toContain("Conversation scope: 7");
+    expect(delegatedSessionKey).not.toBe("");
+    expect(result.details).toMatchObject({
+      sourceConversationId: 7,
+      citedIds: ["sum_a", "sum_b"],
+      expandedSummaryCount: 2,
     });
   });
 

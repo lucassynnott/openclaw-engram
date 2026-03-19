@@ -13,9 +13,14 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
-} from "openclaw/plugin-sdk";
+  ContextEngineMessage,
+} from "../integration/openclaw-bridge.js";
 import { ContextAssembler } from "./assembler.js";
-import { CompactionEngine, type CompactionConfig } from "../memory/compaction.js";
+import {
+  CompactionEngine,
+  type CompactionConfig,
+  type PreCompactionCaptureMessage,
+} from "../memory/compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection, closeLcmConnection } from "../db/connection.js";
 import { getLcmDbFeatures } from "../db/features.js";
@@ -33,6 +38,10 @@ import {
 } from "../integration/large-files.js";
 import { RetrievalEngine } from "../memory/retrieval.js";
 import {
+  capturePreCompactionMemories,
+  sanitizeMemoryNoteMessage,
+} from "../memory/capture.js";
+import {
   ConversationStore,
   type CreateMessagePartInput,
   type MessagePartType,
@@ -41,7 +50,7 @@ import { SummaryStore } from "../memory/store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "../memory/summarize.js";
 import type { LcmDependencies } from "../types.js";
 
-type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AgentMessage = ContextEngineMessage;
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -573,8 +582,8 @@ function messageIdentity(role: string, content: string): string {
 
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
-    id: "lcm",
-    name: "Lossless Context Management Engine",
+    id: "engram",
+    name: "Engram Memory and Context Engine",
     version: "0.1.0",
     ownsCompaction: true,
   };
@@ -610,7 +619,7 @@ export class LcmContextEngine implements ContextEngine {
 
     if (!this.fts5Available) {
       this.deps.log.warn(
-        "[lcm] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
+        "[engram] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
       );
     }
 
@@ -632,6 +641,7 @@ export class LcmContextEngine implements ContextEngine {
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,
       timezone: this.config.timezone,
+      captureMessagesBeforeCompaction: (params) => this.capturePreCompactionMessages(params),
     };
     this.compaction = new CompactionEngine(
       this.conversationStore,
@@ -650,6 +660,36 @@ export class LcmContextEngine implements ContextEngine {
     const db = getLcmConnection(this.config.databasePath);
     runLcmMigrations(db, { fts5Available: this.fts5Available });
     this.migrated = true;
+  }
+
+  /** Best-effort durable capture before compaction replaces raw messages. */
+  private capturePreCompactionMessages(params: {
+    conversationId: number;
+    sessionId: string;
+    messages: PreCompactionCaptureMessage[];
+  }): void {
+    try {
+      const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+      const agentId = this.deps.normalizeAgentId(parsed?.agentId);
+      const summary = capturePreCompactionMemories({
+        config: this.config,
+        conversationId: params.conversationId,
+        sessionKey: params.sessionId,
+        agentId,
+        messages: params.messages,
+        includeMemoryNotes: true,
+        minConfidence: this.config.captureMinConfidence,
+      });
+      if (summary.stored > 0) {
+        this.deps.log.info(
+          `[engram] pre-compaction capture stored=${summary.stored} processed=${summary.processed} session=${params.sessionId}`,
+        );
+      }
+    } catch (err) {
+      this.deps.log.warn(
+        `[engram] pre-compaction capture failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**
@@ -747,11 +787,11 @@ export class LcmContextEngine implements ContextEngine {
       if (runtimeSummarizer) {
         return runtimeSummarizer;
       }
-      console.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
+      console.error(`[engram] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
     } catch (err) {
-      console.error(`[lcm] resolveSummarize failed, using emergency fallback:`, err instanceof Error ? err.message : err);
+      console.error(`[engram] resolveSummarize failed, using emergency fallback:`, err instanceof Error ? err.message : err);
     }
-    console.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
+    console.error(`[engram] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
     return createEmergencyFallbackSummarize();
   }
 
@@ -1050,7 +1090,7 @@ export class LcmContextEngine implements ContextEngine {
             const pruned = await this.pruneHeartbeatOkTurns(conversationId);
             if (pruned > 0) {
               console.error(
-                `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+                `[engram] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
               );
             }
           }
@@ -1110,13 +1150,13 @@ export class LcmContextEngine implements ContextEngine {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
             console.error(
-              `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
+              `[engram] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
             );
           }
         }
       } catch (err) {
         console.error(
-          `[lcm] bootstrap: heartbeat pruning failed:`,
+          `[engram] bootstrap: heartbeat pruning failed:`,
           err instanceof Error ? err.message : err,
         );
       }
@@ -1134,13 +1174,24 @@ export class LcmContextEngine implements ContextEngine {
     if (isHeartbeat) {
       return { ingested: false };
     }
-    const stored = toStoredMessage(message);
+    let effectiveMessage = message;
+    const sanitized = sanitizeMemoryNoteMessage(
+      message as AgentMessage & { role?: unknown; content?: unknown },
+    );
+    if (!sanitized) {
+      effectiveMessage = message;
+    } else if ("block" in sanitized && sanitized.block) {
+      return { ingested: false };
+    } else if ("message" in sanitized) {
+      effectiveMessage = sanitized.message as AgentMessage;
+    }
+    const stored = toStoredMessage(effectiveMessage);
 
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
     const conversationId = conversation.conversationId;
 
-    let messageForParts = message;
+    let messageForParts = effectiveMessage;
     if (stored.role === "user") {
       const intercepted = await this.interceptLargeFiles({
         conversationId,
@@ -1149,9 +1200,9 @@ export class LcmContextEngine implements ContextEngine {
       if (intercepted) {
         stored.content = intercepted.rewrittenContent;
         stored.tokenCount = estimateTokens(stored.content);
-        if ("content" in message) {
+        if ("content" in effectiveMessage) {
           messageForParts = {
-            ...message,
+            ...effectiveMessage,
             content: stored.content,
           } as AgentMessage;
         }

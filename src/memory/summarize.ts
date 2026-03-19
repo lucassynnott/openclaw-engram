@@ -652,13 +652,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   try {
     resolved = params.deps.resolveModel(modelRef, providerHint || undefined);
   } catch (err) {
-    console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
+    console.error(`[engram] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
   }
 
   const { provider, model } = resolved;
   if (!provider || !model) {
-    console.error(`[lcm] createLcmSummarize: empty provider="${provider}" or model="${model}"`);
+    console.error(`[engram] createLcmSummarize: empty provider="${provider}" or model="${model}"`);
     return undefined;
   }
   const authProfileId =
@@ -751,7 +751,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         summary = envelopeNormalized.summary;
         summarySource = "envelope";
         console.error(
-          `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
+          `[engram] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
             `block_types=${formatBlockTypes(envelopeNormalized.blockTypes)}; source=envelope`,
         );
       }
@@ -760,7 +760,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     if (!summary) {
       const responseDiag = extractResponseDiagnostics(result);
       const diagParts = [
-        `[lcm] empty normalized summary on first attempt`,
+        `[engram] empty normalized summary on first attempt`,
         `provider=${provider}`,
         `model=${model}`,
         `block_types=${formatBlockTypes(normalized.blockTypes)}`,
@@ -801,13 +801,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         if (summary) {
           summarySource = "retry";
           console.error(
-            `[lcm] retry succeeded; provider=${provider}; model=${model}; ` +
+            `[engram] retry succeeded; provider=${provider}; model=${model}; ` +
               `block_types=${formatBlockTypes(retryNormalized.blockTypes)}; source=retry`,
           );
         } else {
           const retryDiag = extractResponseDiagnostics(retryResult);
           const retryParts = [
-            `[lcm] retry also returned empty summary`,
+            `[engram] retry also returned empty summary`,
             `provider=${provider}`,
             `model=${model}`,
             `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
@@ -821,7 +821,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       } catch (retryErr) {
         // Retry is best-effort; log and proceed to deterministic fallback.
         console.error(
-          `[lcm] retry failed; provider=${provider} model=${model}; error=${
+          `[engram] retry failed; provider=${provider} model=${model}; error=${
             retryErr instanceof Error ? retryErr.message : String(retryErr)
           }; falling back to truncation`,
         );
@@ -831,14 +831,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     if (!summary) {
       summarySource = "fallback";
       console.error(
-        `[lcm] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
+        `[engram] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
       );
       return buildDeterministicFallbackSummary(text, targetTokens);
     }
 
     if (summarySource !== "content") {
       console.error(
-        `[lcm] summary resolved via non-content path; provider=${provider}; model=${model}; source=${summarySource}`,
+        `[engram] summary resolved via non-content path; provider=${provider}; model=${model}; source=${summarySource}`,
       );
     }
 

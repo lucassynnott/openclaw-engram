@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createMemoryAddTool } from "../src/surface/memory-add-tool.js";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import type { LcmConfig } from "../src/db/config.js";
+import { makeTestConfig } from "./test-config.js";
 
 const TEST_DB_PATH = ":memory:";
 
 function makeConfig(): LcmConfig {
-  return {
-    enabled: true,
+  return makeTestConfig({
     databasePath: TEST_DB_PATH,
     contextThreshold: 0.75,
     freshTailCount: 8,
@@ -25,7 +25,7 @@ function makeConfig(): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-  };
+  });
 }
 
 describe("memory_add tool", () => {

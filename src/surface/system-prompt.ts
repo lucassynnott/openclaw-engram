@@ -10,7 +10,7 @@ export interface SystemPromptOptions {
   lcmEnabled?: boolean;
   /** Whether long-term memory (Gigabrain layer) is active. Default: true */
   memoryEnabled?: boolean;
-  /** Whether episodic/temporal tools are available (P3 feature). Default: false */
+  /** Whether episodic/temporal tools are available. Default: true */
   episodicEnabled?: boolean;
   /** Whether alignment tools are available (P3 feature). Default: false */
   alignmentEnabled?: boolean;
@@ -26,7 +26,7 @@ export function generateEngramSystemPrompt(opts: SystemPromptOptions = {}): stri
   const {
     lcmEnabled = true,
     memoryEnabled = true,
-    episodicEnabled = false,
+    episodicEnabled = true,
     alignmentEnabled = false,
   } = opts;
 
@@ -66,11 +66,14 @@ These tools persist and recall knowledge across sessions.
 | \`memory_add\` | Store a fact, preference, decision, or entity. Use kinds: USER_FACT, PREFERENCE, DECISION, ENTITY, EPISODE, AGENT_IDENTITY, CONTEXT. |
 | \`memory_recall\` | Load top-k memories by confidence at session start. Use to prime context with user background. |
 | \`memory_search\` | Keyword/semantic search for what is known about a topic, person, or project. |
-| \`memory_query\` | Search with date filtering. Use for "what happened in March" or "decisions made last quarter". |
+| \`memory_query\` | Strategy-aware recall for timelines, entity briefs, and targeted memory questions. |
 | \`memory_world\` | Surface the entity model — people, projects, organizations known to the system. |
-| \`memory_get_entity\` | Fetch a specific entity by UUID (get IDs from memory_world). |
-| \`memory_get_episode\` | Fetch a specific episode by UUID. |
-| \`memory_namespace_status\` | Check memory store health and capacity. |
+| \`memory_get\` | Fetch a memory, episode, summary, file, or entity by ID. |
+| \`entity_get\` | Fetch a rich entity profile with beliefs, episodes, and syntheses. |
+| \`vault_query\` | Query imported StingerVault data or the vault mirror by category and text. |
+| \`ops_status\` | Single-call Engram health dashboard across memory, LCM, vault, and alignment. |
+
+**Compatibility aliases:** \`memory_get_entity\`, \`memory_get_episode\`, and \`memory_namespace_status\` remain available for older prompts and tooling.
 
 **Memory capture rules:**
 - Always call \`memory_add\` when the user expresses a preference, makes a decision, or shares a personal fact.
@@ -95,6 +98,7 @@ These tools persist and recall knowledge across sessions.
 
 | Tool | When to use |
 |------|-------------|
+| \`gradient_score\` | Evaluate a response against the alignment profile. |
 | \`alignment_status\` | Check alignment engine health and current mode. |
 | \`alignment_check\` | Evaluate a text or action for alignment before executing. |
 | \`alignment_drift\` | Check rolling alignment drift statistics. |`);
@@ -114,7 +118,7 @@ export function generateEngramToolList(opts: SystemPromptOptions = {}): string {
   const {
     lcmEnabled = true,
     memoryEnabled = true,
-    episodicEnabled = false,
+    episodicEnabled = true,
     alignmentEnabled = false,
   } = opts;
 
@@ -141,6 +145,10 @@ export function generateEngramToolList(opts: SystemPromptOptions = {}): string {
       "memory_search",
       "memory_query",
       "memory_world",
+      "memory_get",
+      "entity_get",
+      "vault_query",
+      "ops_status",
       "memory_get_entity",
       "memory_get_episode",
       "memory_namespace_status",
@@ -152,7 +160,7 @@ export function generateEngramToolList(opts: SystemPromptOptions = {}): string {
   }
 
   if (alignmentEnabled) {
-    tools.push("alignment_status", "alignment_check", "alignment_drift");
+    tools.push("gradient_score", "alignment_status", "alignment_check", "alignment_drift");
   }
 
   return `<engram-tools>\nAvailable memory tools: ${tools.join(", ")}\n</engram-tools>`;

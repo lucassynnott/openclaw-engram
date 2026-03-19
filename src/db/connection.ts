@@ -40,7 +40,7 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
   // Ensure parent directory exists
   mkdirSync(dirname(dbPath), { recursive: true });
 
-  const db = new DatabaseSync(dbPath);
+  const db = new DatabaseSync(dbPath, { allowExtension: true });
 
   // Enable WAL mode for better concurrent read performance
   db.exec("PRAGMA journal_mode = WAL");

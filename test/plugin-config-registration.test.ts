@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import lcmPlugin from "../index.js";
-import { closeLcmConnection } from "../src/db/connection.js";
+import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 
@@ -95,6 +95,20 @@ function defaultModelConfig(model: string): Record<string, unknown> {
   };
 }
 
+function collectRegisteredToolNames(api: OpenClawPluginApi): string[] {
+  const registerTool = api.registerTool as unknown as ReturnType<typeof vi.fn>;
+  return registerTool.mock.calls
+    .map(([factory]) => {
+      const tool = (
+        factory as (ctx: { sessionKey: string }) => {
+          name: string;
+        }
+      )({ sessionKey: "agent:main:test-session" });
+      return tool.name;
+    })
+    .sort();
+}
+
 describe("lcm plugin registration", () => {
   const dbPaths = new Set<string>();
   const tempDirs = new Set<string>();
@@ -139,8 +153,59 @@ describe("lcm plugin registration", () => {
       largeFileTokenThreshold: 12345,
     });
     expect(infoLog).toHaveBeenCalledWith(
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[engram] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
     );
+    const tableNames = getLcmConnection(dbPath)
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE name IN ('memory_vectors', 'memory_vector_rowids', 'memory_vector_index')
+         ORDER BY name`,
+      )
+      .all() as Array<{ name?: string }>;
+    expect(tableNames).toEqual([
+      { name: "memory_vector_index" },
+      { name: "memory_vector_rowids" },
+      { name: "memory_vectors" },
+    ]);
+  });
+
+  it("registers the full implemented Engram tool surface", () => {
+    const { api } = buildApi({
+      enabled: true,
+    });
+
+    lcmPlugin.register(api);
+
+    expect(collectRegisteredToolNames(api)).toEqual([
+      "alignment_check",
+      "alignment_drift",
+      "alignment_status",
+      "context_describe",
+      "context_expand",
+      "context_grep",
+      "context_query",
+      "entity_get",
+      "gradient_score",
+      "lcm_describe",
+      "lcm_expand",
+      "lcm_expand_query",
+      "lcm_grep",
+      "memory_add",
+      "memory_get",
+      "memory_get_entity",
+      "memory_get_episode",
+      "memory_ingest_now",
+      "memory_job_status",
+      "memory_list_agents",
+      "memory_namespace_status",
+      "memory_query",
+      "memory_recall",
+      "memory_search",
+      "memory_world",
+      "ops_status",
+      "vault_query",
+    ]);
   });
 
   it("inherits OpenClaw's default model for summarization when no LCM model override is set", () => {

@@ -25,6 +25,7 @@ type LcmToolInput = {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
+  requesterSessionKey?: string;
 };
 
 export function createContextGrepTool(input: LcmToolInput): AnyAgentTool {

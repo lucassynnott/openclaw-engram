@@ -3,6 +3,8 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .worktrees
+.firecrawl/
+.ralphy-worktrees/
 
 # TUI
 tui/lcm-tui
