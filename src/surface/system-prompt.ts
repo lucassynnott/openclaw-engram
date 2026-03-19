@@ -64,19 +64,24 @@ These tools persist and recall knowledge across sessions.
 | Tool | When to use |
 |------|-------------|
 | \`memory_add\` | Store a fact, preference, decision, or entity. Use kinds: USER_FACT, PREFERENCE, DECISION, ENTITY, EPISODE, AGENT_IDENTITY, CONTEXT. |
+| \`memory_correct\` | Replace an existing memory with a corrected version and supersede the old one. |
+| \`memory_retract\` | Mark a memory as wrong/superseded so it stops surfacing in normal recall. |
 | \`memory_recall\` | Load top-k memories by confidence at session start. Use to prime context with user background. |
 | \`memory_search\` | Keyword/semantic search for what is known about a topic, person, or project. |
 | \`memory_query\` | Strategy-aware recall for timelines, entity briefs, and targeted memory questions. |
 | \`memory_world\` | Surface the entity model — people, projects, organizations known to the system. |
 | \`memory_get\` | Fetch a memory, episode, summary, file, or entity by ID. |
 | \`entity_get\` | Fetch a rich entity profile with beliefs, episodes, and syntheses. |
+| \`entity_merge\` | Merge duplicate entities into a canonical entity when the world model has split the same person/project across aliases. |
 | \`vault_query\` | Query imported StingerVault data or the vault mirror by category and text. |
-| \`ops_status\` | Single-call Engram health dashboard across memory, LCM, vault, and alignment. |
+| \`ops_status\` / \`engram_status\` | Single-call Engram health dashboard across memory, LCM, vault, and alignment. |
 
 **Compatibility aliases:** \`memory_get_entity\`, \`memory_get_episode\`, and \`memory_namespace_status\` remain available for older prompts and tooling.
 
 **Memory capture rules:**
 - Always call \`memory_add\` when the user expresses a preference, makes a decision, or shares a personal fact.
+- If the user says a memory is wrong or outdated, use \`memory_correct\` or \`memory_retract\` instead of leaving the stale memory active.
+- Use \`memory_add\` with \`triggerPattern\` for standing orders or proactive reminders that should surface when future prompts match.
 - Use \`memory_recall\` at the start of new sessions before responding to greetings or context-dependent questions.
 - Do NOT capture: system noise, tool outputs, transient session state, credentials, or API keys.`);
   }
@@ -147,6 +152,7 @@ export function generateEngramToolList(opts: SystemPromptOptions = {}): string {
       "memory_world",
       "memory_get",
       "entity_get",
+      "entity_merge",
       "vault_query",
       "ops_status",
       "memory_get_entity",

@@ -77,6 +77,21 @@ export function ensureMemoryTables(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_memory_events_memory_ts
       ON memory_events(memory_id, timestamp);
 
+    CREATE TABLE IF NOT EXISTS memory_triggers (
+      trigger_id TEXT PRIMARY KEY,
+      memory_id TEXT NOT NULL,
+      pattern TEXT NOT NULL,
+      matcher TEXT NOT NULL DEFAULT 'substring',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_triggers_memory
+      ON memory_triggers(memory_id, enabled);
+    CREATE INDEX IF NOT EXISTS idx_memory_triggers_pattern
+      ON memory_triggers(pattern, enabled);
+
     CREATE TABLE IF NOT EXISTS memory_entities (
       entity_id TEXT PRIMARY KEY,
       kind TEXT NOT NULL DEFAULT 'person',

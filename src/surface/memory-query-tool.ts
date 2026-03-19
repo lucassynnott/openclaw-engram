@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
-import { findEntityMatches, getEntityDetail } from "../entity/world-model.js";
+import { ensureWorldModelReady, findEntityMatches, getEntityDetail } from "../entity/world-model.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { fetchMemoryCandidates } from "./memory-recall-core.js";
@@ -348,6 +348,7 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
       let db: DatabaseSync;
       try {
         db = getLcmConnection(input.config.databasePath);
+        ensureWorldModelReady({ db, config: input.config });
       } catch (err) {
         return jsonResult({
           error: "Memory store unavailable.",
@@ -449,6 +450,8 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
           score: Number(memory.score.toFixed(4)),
           vector_similarity: Number(memory.vectorSimilarity.toFixed(4)),
           confidence: memory.confidence,
+          effective_confidence: memory.effectiveConfidence,
+          stored_by: memory.sourceAgent,
           content_time: memory.contentTime,
           tags: memory.tags,
           created_at: memory.createdAt,

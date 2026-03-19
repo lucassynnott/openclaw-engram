@@ -4,6 +4,7 @@ import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { createMemoryAddTool } from "../src/surface/memory-add-tool.js";
 import {
   createEntityGetTool,
+  createEntityMergeTool,
   createGradientScoreTool,
   createMemoryGetTool,
   createOpsStatusTool,
@@ -139,7 +140,42 @@ describe("engram v2 compatibility tools", () => {
 
     expect(result.details.itemType).toBe("entity");
     expect(result.details.entity.name).toBe("Lucas");
+    expect(Array.isArray(result.details.links)).toBe(true);
     expect(Array.isArray(result.details.memories) || Array.isArray(result.details.beliefs)).toBe(true);
+  });
+
+  it("entity_merge persists a durable merge override", async () => {
+    const addTool = createMemoryAddTool({ config });
+    const mergeTool = createEntityMergeTool({ config });
+    const entityGetTool = createEntityGetTool({ config });
+
+    await addTool.execute("t_merge_1", {
+      content: "Lucas owns Engram release coordination and rollout diagnostics",
+      kind: "USER_FACT",
+      entities: ["Lucas"],
+      dedupeMode: "none",
+    });
+    await addTool.execute("t_merge_2", {
+      content: "Lukas handles Engram partner coordination and launch notes",
+      kind: "USER_FACT",
+      entities: ["Lukas"],
+      dedupeMode: "none",
+    });
+
+    const mergeResult = await mergeTool.execute("t_merge_3", {
+      winnerName: "Lucas",
+      loserName: "Lukas",
+      reason: "same person alias",
+    });
+
+    expect(mergeResult.details.ok).toBe(true);
+    expect(mergeResult.details.winnerEntityId).toMatch(/^person:/);
+
+    const entityResult = await entityGetTool.execute("t_merge_4", {
+      entityId: String(mergeResult.details.winnerEntityId),
+    });
+    expect(entityResult.details.entity.id).toBe(mergeResult.details.winnerEntityId);
+    expect(Array.isArray(entityResult.details.links)).toBe(true);
   });
 
   it("ops_status aggregates counts across memory and LCM surfaces", async () => {
@@ -179,6 +215,7 @@ describe("engram v2 compatibility tools", () => {
     expect(result.details.memory.active_memories).toBeGreaterThan(0);
     expect(result.details.memory.vector_rows).toBeGreaterThan(0);
     expect(result.details.lcm.summaries).toBeGreaterThan(0);
+    expect(result.details.world_model.links).toBeGreaterThanOrEqual(0);
     expect(result.details.alignment.status).toBe("active");
   });
 

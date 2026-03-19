@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-import { ensurePersonStore } from "./person-service.js";
+import { ensurePersonStore, rebuildEntityMentions } from "./person-service.js";
 
 // ---------------------------------------------------------------------------
 // Inline helpers
@@ -154,6 +154,20 @@ const isLikelyPersonAlias = (value = ""): boolean => {
 };
 
 const tokenizeNormalizedValue = (value = ""): string[] => normalizeContent(value).split(/\s+/).filter(Boolean);
+
+const overlapSimilarity = (left = "", right = ""): number => {
+  const leftTokens = new Set(tokenizeNormalizedValue(left));
+  const rightTokens = new Set(tokenizeNormalizedValue(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  let intersection = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) intersection += 1;
+  }
+  const union = new Set([...leftTokens, ...rightTokens]).size || 1;
+  const overlap = intersection / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+  const jaccard = intersection / union;
+  return Math.max(overlap, jaccard);
+};
 
 const hasAliasTokenMatch = (content = "", alias = ""): boolean => {
   const contentTokens = tokenizeNormalizedValue(content);
@@ -937,12 +951,36 @@ export const ensureWorldModelStore = (db: DatabaseSync): void => {
     );
     CREATE INDEX IF NOT EXISTS idx_entity_syntheses_subject ON entity_syntheses(subject_type, subject_id, kind);
     CREATE INDEX IF NOT EXISTS idx_entity_syntheses_kind ON entity_syntheses(kind, generated_at);
+
+    CREATE TABLE IF NOT EXISTS entity_merge_overrides (
+      loser_entity_id TEXT PRIMARY KEY,
+      winner_entity_id TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_merge_overrides_winner ON entity_merge_overrides(winner_entity_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS entity_links (
+      link_id TEXT PRIMARY KEY,
+      entity_id TEXT NOT NULL,
+      record_type TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      payload TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_links_entity ON entity_links(entity_id, record_type, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_entity_links_record ON entity_links(record_type, record_id, updated_at);
   `);
 };
 
 const clearWorldModelStore = (db: DatabaseSync): void => {
   ensureWorldModelStore(db);
   db.exec(`
+    DELETE FROM entity_links;
     DELETE FROM entity_syntheses;
     DELETE FROM entity_open_loops;
     DELETE FROM entity_episodes;
@@ -982,10 +1020,16 @@ const inferEntityKind = (entityKey: string, memoryRows: Record<string, unknown>[
   const text = memoryRows.map((row) => String(row.content || "")).join("\n");
   const hasRelationshipMention = mentionRows.some((row) => String(row.role || "").toLowerCase() === "relationship");
   const hasPublicProfileMention = mentionRows.some((row) => String(row.role || "").toLowerCase() === "public_profile");
+  const hasExplicitTag = mentionRows.some((row) => {
+    const source = String(row.source || "").toLowerCase();
+    const role = String(row.role || "").toLowerCase();
+    return source === "memory_tag" || role === "explicit_tag";
+  });
   const hasOrganizationCue = memoryRows.some((row) => hasAliasCueWithinWindow(String(row.content || ""), entityKey, ORG_CUE_TOKENS, 5));
   const hasProjectCue = memoryRows.some((row) => hasAliasCueWithinWindow(String(row.content || ""), entityKey, new Set([...PROJECT_CUE_TOKENS, "model", "tool", "provider", "weights", "api", "openrouter", "moonshot"]), 5));
   const hasPlaceCue = memoryRows.some((row) => hasPlacePatternForAlias(String(row.content || ""), entityKey));
   if (hasRelationshipMention && isEntityKindEnabled(config, "person")) return "person";
+  if (hasExplicitTag && isLikelyPersonAlias(entityKey) && isEntityKindEnabled(config, "person")) return "person";
   if (hasPublicProfileMention && isLikelyPersonAlias(entityKey) && isEntityKindEnabled(config, "person")) return "person";
   if (RELATIONSHIP_RE.test(text) && isLikelyPersonAlias(entityKey) && isEntityKindEnabled(config, "person")) return "person";
   if (hasOrganizationCue && isEntityKindEnabled(config, "organization")) return "organization";
@@ -1054,6 +1098,11 @@ const evaluateEntityCandidate = ({ entityKey = "", kind = "", aliases = [] as st
   const evidenceCount = relatedMemoryRows.length;
   const hasCuratedEvidence = hasCuratedOrMemoryEvidence(relatedMemoryRows);
   const explicitlyTyped = relatedMemoryRows.some((row) => String(row.type || "").trim().toUpperCase() === "ENTITY");
+  const explicitlyTagged = mentionRows.some((row) => {
+    const source = String(row.source || "").toLowerCase();
+    const role = String(row.role || "").toLowerCase();
+    return source === "memory_tag" || role === "explicit_tag";
+  });
   const normalizedAliases = filteredAliases.map((alias) => normalizeContent(alias)).filter(Boolean);
   const hasOrganizationCue = relatedMemoryRows.some((row) => filteredAliases.some((alias) => hasAliasCueWithinWindow(String(row.content || ""), alias, ORG_CUE_TOKENS, 5)));
   const hasProjectCue = relatedMemoryRows.some((row) => filteredAliases.some((alias) => hasAliasCueWithinWindow(String(row.content || ""), alias, PROJECT_CUE_TOKENS, 5)));
@@ -1063,10 +1112,10 @@ const evaluateEntityCandidate = ({ entityKey = "", kind = "", aliases = [] as st
   const surfaceKindAllowed = surfaceConfig.allowedKinds.includes(String(kind || "").trim().toLowerCase());
   const surfaceConfidenceThreshold = kind === "person" ? surfaceConfig.minConfidence : ["organization", "project"].includes(kind) ? Math.min(surfaceConfig.minConfidence, 0.65) : surfaceConfig.minConfidence;
   const highSurfaceConfidence = confidence >= surfaceConfidenceThreshold;
-  const effectiveSurfaceConfidence = kind === "person" && strongName && evidenceCount >= surfaceConfig.minEvidence ? confidence >= Math.min(surfaceConfidenceThreshold, 0.62) : highSurfaceConfidence;
+  const effectiveSurfaceConfidence = kind === "person" && strongName && (evidenceCount >= surfaceConfig.minEvidence || explicitlyTagged) ? confidence >= Math.min(surfaceConfidenceThreshold, 0.62) : highSurfaceConfidence;
   if (kind === "person") {
-    const enoughEvidence = evidenceCount >= Math.max(surfaceConfig.minEvidence, 2);
-    if ((!strongName && !strongMention) || !isLikelyPersonAlias(entityKey) || (!enoughEvidence && !strongMention && !hasCuratedEvidence)) return { accepted: false, kind, aliases: filteredAliases, reason: "weak_person_evidence" };
+    const enoughEvidence = explicitlyTagged && strongName ? evidenceCount >= 1 : evidenceCount >= Math.max(surfaceConfig.minEvidence, 2);
+    if ((!strongName && !strongMention && !explicitlyTagged) || !isLikelyPersonAlias(entityKey) || (!enoughEvidence && !strongMention && !hasCuratedEvidence && !explicitlyTagged)) return { accepted: false, kind, aliases: filteredAliases, reason: "weak_person_evidence" };
   }
   if (kind === "organization") {
     const enoughEvidence = evidenceCount >= 2 || mentionRows.length >= 2;
@@ -1118,18 +1167,26 @@ export const ensureWorldModelReady = ({ db, config = {} as Record<string, unknow
   if ((config?.worldModel as Record<string, unknown>)?.enabled === false) return { rebuilt: false, counts: {} };
   const entityCount = Number((db.prepare("SELECT COUNT(*) AS c FROM entities").get() as Record<string, number> | undefined)?.c || 0);
   let activeCount = 0;
-  let latestMemoryUpdatedAt = "";
-  try {
-    activeCount = Number((db.prepare("SELECT COUNT(*) AS c FROM summaries WHERE content IS NOT NULL AND content != ''").get() as Record<string, number> | undefined)?.c || 0);
-    latestMemoryUpdatedAt = String((db.prepare("SELECT COALESCE(MAX(created_at), '') AS updated_at FROM summaries").get() as Record<string, string> | undefined)?.updated_at || "").trim();
-  } catch {
-    // summaries table may not exist in isolated test contexts
-    activeCount = 0;
-    latestMemoryUpdatedAt = "";
-  }
+  let latestSourceUpdatedAt = "";
+  const summaryCount = hasTable(db, "summaries")
+    ? Number((db.prepare("SELECT COUNT(*) AS c FROM summaries WHERE content IS NOT NULL AND content != ''").get() as Record<string, number> | undefined)?.c || 0)
+    : 0;
+  const memoryCount = hasTable(db, "memory_current")
+    ? Number((db.prepare("SELECT COUNT(*) AS c FROM memory_current WHERE content IS NOT NULL AND content != ''").get() as Record<string, number> | undefined)?.c || 0)
+    : 0;
+  const summaryUpdatedAt = hasTable(db, "summaries")
+    ? String((db.prepare("SELECT COALESCE(MAX(created_at), '') AS updated_at FROM summaries").get() as Record<string, string> | undefined)?.updated_at || "").trim()
+    : "";
+  const memoryUpdatedAt = hasTable(db, "memory_current")
+    ? String((db.prepare("SELECT COALESCE(MAX(updated_at), MAX(created_at), '') AS updated_at FROM memory_current").get() as Record<string, string> | undefined)?.updated_at || "").trim()
+    : "";
+  activeCount = summaryCount + memoryCount;
+  latestSourceUpdatedAt = [summaryUpdatedAt, memoryUpdatedAt]
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || "";
   const latestSynthesisGeneratedAt = String((db.prepare("SELECT COALESCE(MAX(generated_at), '') AS generated_at FROM entity_syntheses").get() as Record<string, string> | undefined)?.generated_at || "").trim();
   const projectedRows = Number((db.prepare(`SELECT ((SELECT COUNT(*) FROM entities) + (SELECT COUNT(*) FROM entity_beliefs) + (SELECT COUNT(*) FROM entity_episodes) + (SELECT COUNT(*) FROM entity_open_loops) + (SELECT COUNT(*) FROM entity_syntheses)) AS c`).get() as Record<string, number> | undefined)?.c || 0);
-  const needsRefresh = Boolean(activeCount > 0 && latestMemoryUpdatedAt && (!latestSynthesisGeneratedAt || Date.parse(latestMemoryUpdatedAt) > Date.parse(latestSynthesisGeneratedAt)));
+  const needsRefresh = Boolean(activeCount > 0 && latestSourceUpdatedAt && (!latestSynthesisGeneratedAt || Date.parse(latestSourceUpdatedAt) > Date.parse(latestSynthesisGeneratedAt)));
   if (activeCount === 0) {
     if (projectedRows > 0) { clearWorldModelStore(db); return { ok: true, rebuilt: true, cleared: true, counts: { entities: 0, aliases: 0, beliefs: 0, episodes: 0, open_loops: 0, contradictions: 0, syntheses: 0 } }; }
     return { rebuilt: false, counts: { entities: 0 } };
@@ -1137,6 +1194,200 @@ export const ensureWorldModelReady = ({ db, config = {} as Record<string, unknow
   if ((!rebuildIfEmpty && !needsRefresh) || (entityCount > 0 && !needsRefresh)) return { rebuilt: false, counts: { entities: entityCount } };
   return rebuildWorldModel({ db, config });
 };
+
+type EntityMergeOverride = {
+  loserEntityId: string;
+  winnerEntityId: string;
+  reason: string;
+};
+
+function loadEntityMergeOverrides(db: DatabaseSync): Map<string, EntityMergeOverride> {
+  ensureWorldModelStore(db);
+  const rows = db
+    .prepare(
+      `SELECT loser_entity_id, winner_entity_id, reason
+       FROM entity_merge_overrides`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const out = new Map<string, EntityMergeOverride>();
+  for (const row of rows) {
+    const loserEntityId = String(row.loser_entity_id || "").trim();
+    const winnerEntityId = String(row.winner_entity_id || "").trim();
+    if (!loserEntityId || !winnerEntityId || loserEntityId === winnerEntityId) {
+      continue;
+    }
+    out.set(loserEntityId, {
+      loserEntityId,
+      winnerEntityId,
+      reason: String(row.reason || "").trim(),
+    });
+  }
+  return out;
+}
+
+function resolveMergedEntityId(
+  entityId: string,
+  overrides: Map<string, EntityMergeOverride>,
+): string {
+  let current = String(entityId || "").trim();
+  const seen = new Set<string>();
+  while (current && overrides.has(current) && !seen.has(current)) {
+    seen.add(current);
+    current = overrides.get(current)?.winnerEntityId || current;
+  }
+  return current;
+}
+
+function applyEntityMergeOverrides(params: {
+  db: DatabaseSync;
+  entityRows: Array<Record<string, unknown>>;
+  aliasRows: Array<Record<string, unknown>>;
+  beliefRows: Array<Record<string, unknown>>;
+  episodeRows: Array<Record<string, unknown>>;
+  openLoopRows: Array<Record<string, unknown>>;
+  synthesisRows: Array<Record<string, unknown>>;
+  now: string;
+}): {
+  entityRows: Array<Record<string, unknown>>;
+  aliasRows: Array<Record<string, unknown>>;
+  beliefRows: Array<Record<string, unknown>>;
+  episodeRows: Array<Record<string, unknown>>;
+  openLoopRows: Array<Record<string, unknown>>;
+  synthesisRows: Array<Record<string, unknown>>;
+} {
+  const overrides = loadEntityMergeOverrides(params.db);
+  if (overrides.size === 0) {
+    return {
+      entityRows: params.entityRows,
+      aliasRows: params.aliasRows,
+      beliefRows: params.beliefRows,
+      episodeRows: params.episodeRows,
+      openLoopRows: params.openLoopRows,
+      synthesisRows: params.synthesisRows,
+    };
+  }
+
+  const entityById = new Map<string, Record<string, unknown>>();
+  for (const row of params.entityRows) {
+    const currentId = String(row.entity_id || "").trim();
+    if (!currentId) {
+      continue;
+    }
+    const targetId = resolveMergedEntityId(currentId, overrides);
+    const existing = entityById.get(targetId);
+    const rowAliases = Array.isArray(row.aliases)
+      ? row.aliases.filter((value): value is string => typeof value === "string")
+      : [];
+    const mergedAliases = filterEntityAliases([
+      ...(existing && Array.isArray(existing.aliases)
+        ? existing.aliases.filter((value): value is string => typeof value === "string")
+        : []),
+      ...rowAliases,
+      String(row.display_name || ""),
+    ]);
+    const mergedPayload = {
+      ...(existing?.payload as Record<string, unknown> | undefined || {}),
+      ...(row.payload as Record<string, unknown> | undefined || {}),
+    };
+    const mergedEntityIds = new Set<string>(
+      Array.isArray(mergedPayload.merged_entity_ids)
+        ? mergedPayload.merged_entity_ids.filter((value): value is string => typeof value === "string")
+        : [],
+    );
+    if (targetId !== currentId) {
+      mergedEntityIds.add(currentId);
+      mergedPayload.merged_from = Array.from(mergedEntityIds).sort();
+    }
+    entityById.set(targetId, {
+      ...(existing || row),
+      entity_id: targetId,
+      aliases: mergedAliases,
+      confidence: Math.max(Number(existing?.confidence || 0), Number(row.confidence || 0)),
+      updated_at: [String(existing?.updated_at || ""), String(row.updated_at || ""), params.now]
+        .filter(Boolean)
+        .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || params.now,
+      payload: mergedPayload,
+    });
+  }
+
+  const dedupedAliases = new Map<string, Record<string, unknown>>();
+  for (const row of params.aliasRows) {
+    const targetId = resolveMergedEntityId(String(row.entity_id || ""), overrides);
+    if (!targetId) {
+      continue;
+    }
+    const alias = String(row.alias || "").trim();
+    const normalizedAlias = normalizeContent(row.normalized_alias || row.alias || "");
+    if (!alias || !normalizedAlias || isGenericAlias(normalizedAlias)) {
+      continue;
+    }
+    const key = `${targetId}|${normalizedAlias}`;
+    const existing = dedupedAliases.get(key);
+    const nextRow: Record<string, unknown> = {
+      ...row,
+      entity_id: targetId,
+      alias_id: `${targetId}:${slugify(normalizedAlias)}`,
+      alias,
+      normalized_alias: normalizedAlias,
+    };
+    if (!existing || Number(nextRow.confidence || 0) > Number(existing.confidence || 0)) {
+      dedupedAliases.set(key, nextRow);
+    }
+  }
+
+  const beliefRows = params.beliefRows.map((row) => ({
+    ...row,
+    entity_id: resolveMergedEntityId(String(row.entity_id || ""), overrides),
+  }));
+  const episodeRows = params.episodeRows.map((row) => ({
+    ...row,
+    primary_entity_id: resolveMergedEntityId(String(row.primary_entity_id || ""), overrides),
+  }));
+  const openLoopRows = params.openLoopRows.map((row) => ({
+    ...row,
+    related_entity_id: resolveMergedEntityId(String(row.related_entity_id || ""), overrides),
+  }));
+  const dedupedSyntheses = new Map<string, Record<string, unknown>>();
+  for (const row of params.synthesisRows) {
+    const nextRow = (() => {
+      if (String(row.subject_type || "") !== "entity") {
+        return row;
+      }
+      const subjectId = resolveMergedEntityId(String(row.subject_id || ""), overrides);
+      return {
+        ...row,
+        subject_id: subjectId,
+        synthesis_id: `${String(row.kind || "summary")}:${subjectId}`,
+      };
+    })();
+    const synthesisId = String(nextRow.synthesis_id || "").trim();
+    if (!synthesisId) continue;
+    const existing = dedupedSyntheses.get(synthesisId);
+    if (!existing) {
+      dedupedSyntheses.set(synthesisId, nextRow);
+      continue;
+    }
+    const nextConfidence = Number(nextRow.confidence || 0);
+    const existingConfidence = Number(existing.confidence || 0);
+    const preferred = nextConfidence > existingConfidence
+      ? nextRow
+      : nextConfidence < existingConfidence
+        ? existing
+        : String(nextRow.content || "").length > String(existing.content || "").length
+          ? nextRow
+          : existing;
+    dedupedSyntheses.set(synthesisId, preferred);
+  }
+
+  return {
+    entityRows: Array.from(entityById.values()),
+    aliasRows: Array.from(dedupedAliases.values()),
+    beliefRows,
+    episodeRows,
+    openLoopRows,
+    synthesisRows: Array.from(dedupedSyntheses.values()),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // rebuildWorldModel
@@ -1157,6 +1408,7 @@ interface MemoryRow {
   superseded_by: string | null;
   updated_at: string;
   created_at: string;
+  tags?: string | null;
   [key: string]: unknown;
 }
 
@@ -1166,6 +1418,11 @@ const s$ = (v: unknown): null | number | bigint | string | Uint8Array => v as nu
 export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, now = new Date().toISOString() }: { db: DatabaseSync; config?: Record<string, unknown>; now?: string } = { db: undefined as unknown as DatabaseSync }): Record<string, unknown> => {
   ensureWorldModelStore(db);
   ensurePersonStore(db);
+  try {
+    rebuildEntityMentions(db);
+  } catch {
+    // Summary/entity auto-linking is best-effort during rebuild.
+  }
   let rawRows: MemoryRow[] = [];
   try {
     rawRows = db.prepare(`
@@ -1174,12 +1431,29 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
         'shared' AS scope, 'lcm_summary' AS source_layer,
         NULL AS source_path, NULL AS source_line,
         created_at AS content_time, NULL AS valid_until,
-        NULL AS superseded_by, created_at AS updated_at, created_at
+        NULL AS superseded_by, created_at AS updated_at, created_at,
+        '[]' AS tags
       FROM summaries WHERE content IS NOT NULL AND content != ''
     `).all() as unknown as MemoryRow[];
   } catch {
     // summaries table may not exist in isolated test contexts
     rawRows = [];
+  }
+  try {
+    const memoryRows = db.prepare(`
+      SELECT memory_id, content,
+        status, type, confidence,
+        scope, source_layer,
+        source_path, source_line,
+        content_time, valid_until,
+        superseded_by, updated_at, created_at,
+        COALESCE(tags, '[]') AS tags
+      FROM memory_current
+      WHERE content IS NOT NULL AND content != ''
+    `).all() as unknown as MemoryRow[];
+    rawRows = [...rawRows, ...memoryRows];
+  } catch {
+    // memory_current table may not exist in isolated test contexts
   }
   const rows = rawRows.map((row) => ({
     ...row,
@@ -1191,6 +1465,7 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
     source_layer: String(row.source_layer || "registry"),
     source_path: row.source_path ? String(row.source_path) : null,
     source_line: Number.isFinite(Number(row.source_line)) ? Number(row.source_line) : null,
+    tags: typeof row.tags === "string" ? row.tags : "[]",
   }));
   if (rows.length === 0) { clearWorldModelStore(db); return { ok: true, rebuilt: true, cleared: true, counts: { entities: 0, aliases: 0, beliefs: 0, episodes: 0, open_loops: 0, contradictions: 0, syntheses: 0 } }; }
   const rowById = new Map(rows.map((row) => [row.memory_id, row]));
@@ -1207,6 +1482,29 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
     const byMemory = mentionsByMemory.get(memoryId) || new Set<string>();
     byMemory.add(key);
     mentionsByMemory.set(memoryId, byMemory);
+  }
+  for (const row of rows) {
+    const memoryId = String(row.memory_id || "");
+    const rawTags = parseJsonSafe<string[]>(row.tags, []);
+    for (const rawTag of rawTags) {
+      const key = normalizeContent(rawTag);
+      if (!key || isGenericAlias(key)) continue;
+      const tagMention: EntityMentionRow = {
+        id: `${memoryId}|${key}|memory_tag`,
+        memory_id: memoryId,
+        entity_key: key,
+        entity_display: String(rawTag || "").trim() || displayNameFromKey(key),
+        role: "explicit_tag",
+        confidence: 0.98,
+        source: "memory_tag",
+      };
+      const list = mentionsByKey.get(key) || [];
+      list.push(tagMention);
+      mentionsByKey.set(key, list);
+      const byMemory = mentionsByMemory.get(memoryId) || new Set<string>();
+      byMemory.add(key);
+      mentionsByMemory.set(memoryId, byMemory);
+    }
   }
   const resolveRowClaimContext = (row: MemoryRow, acceptedEntityIds: Map<string, string> = new Map()) => {
     const entityKeys = Array.from(mentionsByMemory.get(String(row.memory_id || "")) || []);
@@ -1397,6 +1695,16 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
   });
   synthesisRows.push({ synthesis_id: "briefing:daily-memory", kind: "daily_memory_briefing", subject_type: "global", subject_id: "global", content: buildGlobalSummaryContent({ title: "Daily Memory Briefing", intro: "Key beliefs and episodes refreshed during nightly maintenance.", items: [...recentBeliefs.slice(0, 6).map((b) => ({ kind: "belief", belief: b })), ...recentEpisodes.slice(0, 3).map((e) => ({ kind: "episode", episode: e }))], formatter: (item) => (item as Record<string, unknown>).kind === "episode" ? `- [episode] ${((item as Record<string, unknown>).episode as Record<string, unknown>).summary}` : `- [${((item as Record<string, unknown>).belief as Record<string, unknown>).type}] ${((item as Record<string, unknown>).belief as Record<string, unknown>).content}` }), stale: 0, confidence: 0.8, generated_at: now, input_hash: hashNormalized(JSON.stringify(recentBeliefs.map((b) => b.belief_id))), payload: { count: recentBeliefs.length, curated: true } });
   synthesisRows.push({ synthesis_id: "report:what-changed", kind: "what_changed", subject_type: "global", subject_id: "global", content: buildGlobalSummaryContent({ title: "What Changed", intro: "Most recent memory facts reflected in the world model.", items: recentBeliefs, formatter: (item) => `- ${(item as Record<string, unknown>).valid_from || "recent"} · ${summarizeContent((item as Record<string, unknown>).content, 220)}` }), stale: 0, confidence: 0.78, generated_at: now, input_hash: hashNormalized(JSON.stringify(recentBeliefs.map((b) => b.belief_id))), payload: { count: recentBeliefs.length } });
+  const mergedRows = applyEntityMergeOverrides({
+    db,
+    entityRows,
+    aliasRows,
+    beliefRows: resolvedBeliefRows,
+    episodeRows,
+    openLoopRows: dedupedOpenLoopRows,
+    synthesisRows,
+    now,
+  });
   db.exec("BEGIN");
   try {
     db.prepare("DELETE FROM entity_claims").run();
@@ -1409,20 +1717,273 @@ export const rebuildWorldModel = ({ db, config = {} as Record<string, unknown>, 
     const insertClaim = db.prepare("INSERT INTO entity_claims (memory_id, memory_tier, claim_slot, consolidation_op, source_strength, surface_candidate, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     for (const row of claimRows) insertClaim.run(s$(row.memory_id), s$(row.memory_tier), s$(row.claim_slot), s$(row.consolidation_op), s$(row.source_strength), Number(row.surface_candidate || 0), s$(row.updated_at), JSON.stringify(row.payload || {}));
     const insertEntity = db.prepare("INSERT INTO entities (entity_id, kind, display_name, normalized_name, status, confidence, aliases, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of entityRows) insertEntity.run(s$(row.entity_id), s$(row.kind), s$(row.display_name), s$(row.normalized_name), s$(row.status), s$(row.confidence), JSON.stringify(row.aliases || []), s$(row.created_at), s$(row.updated_at), JSON.stringify(row.payload || {}));
+    for (const row of mergedRows.entityRows) insertEntity.run(s$(row.entity_id), s$(row.kind), s$(row.display_name), s$(row.normalized_name), s$(row.status), s$(row.confidence), JSON.stringify(row.aliases || []), s$(row.created_at), s$(row.updated_at), JSON.stringify(row.payload || {}));
     const insertAlias = db.prepare("INSERT INTO entity_aliases (alias_id, entity_id, alias, normalized_alias, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
-    for (const row of aliasRows) insertAlias.run(s$(row.alias_id), s$(row.entity_id), s$(row.alias), s$(row.normalized_alias), s$(row.confidence), s$(row.created_at), s$(row.updated_at));
+    for (const row of mergedRows.aliasRows) insertAlias.run(s$(row.alias_id), s$(row.entity_id), s$(row.alias), s$(row.normalized_alias), s$(row.confidence), s$(row.created_at), s$(row.updated_at));
     const insertBelief = db.prepare("INSERT INTO entity_beliefs (belief_id, entity_id, type, content, status, confidence, valid_from, valid_to, supersedes_belief_id, source_memory_id, source_layer, source_path, source_line, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of resolvedBeliefRows) insertBelief.run(s$(row.belief_id), s$(row.entity_id), s$(row.type), s$(row.content), s$(row.status), s$(row.confidence), s$(row.valid_from), s$(row.valid_to), s$(row.supersedes_belief_id), s$(row.source_memory_id), s$(row.source_layer), s$(row.source_path), s$(row.source_line), JSON.stringify(row.payload || {}));
+    for (const row of mergedRows.beliefRows) insertBelief.run(s$(row.belief_id), s$(row.entity_id), s$(row.type), s$(row.content), s$(row.status), s$(row.confidence), s$(row.valid_from), s$(row.valid_to), s$(row.supersedes_belief_id), s$(row.source_memory_id), s$(row.source_layer), s$(row.source_path), s$(row.source_line), JSON.stringify(row.payload || {}));
     const insertEpisode = db.prepare("INSERT INTO entity_episodes (episode_id, title, summary, start_date, end_date, status, primary_entity_id, source_memory_ids, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of episodeRows) insertEpisode.run(s$(row.episode_id), s$(row.title), s$(row.summary), s$(row.start_date), s$(row.end_date), s$(row.status), s$(row.primary_entity_id), JSON.stringify(row.source_memory_ids || []), JSON.stringify(row.payload || {}));
+    for (const row of mergedRows.episodeRows) insertEpisode.run(s$(row.episode_id), s$(row.title), s$(row.summary), s$(row.start_date), s$(row.end_date), s$(row.status), s$(row.primary_entity_id), JSON.stringify(row.source_memory_ids || []), JSON.stringify(row.payload || {}));
     const insertOpenLoop = db.prepare("INSERT INTO entity_open_loops (loop_id, kind, title, status, priority, related_entity_id, source_memory_ids, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of dedupedOpenLoopRows) insertOpenLoop.run(s$(row.loop_id), s$(row.kind), s$(row.title), s$(row.status), s$(row.priority), s$(row.related_entity_id), JSON.stringify(row.source_memory_ids || []), JSON.stringify(row.payload || {}));
+    for (const row of mergedRows.openLoopRows) insertOpenLoop.run(s$(row.loop_id), s$(row.kind), s$(row.title), s$(row.status), s$(row.priority), s$(row.related_entity_id), JSON.stringify(row.source_memory_ids || []), JSON.stringify(row.payload || {}));
     const insertSynthesis = db.prepare("INSERT INTO entity_syntheses (synthesis_id, kind, subject_type, subject_id, content, stale, confidence, generated_at, input_hash, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of synthesisRows) insertSynthesis.run(s$(row.synthesis_id), s$(row.kind), s$(row.subject_type), s$(row.subject_id), s$(row.content), Number(row.stale || 0), s$(row.confidence), s$(row.generated_at), s$(row.input_hash), JSON.stringify(row.payload || {}));
+    for (const row of mergedRows.synthesisRows) insertSynthesis.run(s$(row.synthesis_id), s$(row.kind), s$(row.subject_type), s$(row.subject_id), s$(row.content), Number(row.stale || 0), s$(row.confidence), s$(row.generated_at), s$(row.input_hash), JSON.stringify(row.payload || {}));
     db.exec("COMMIT");
   } catch (err) { db.exec("ROLLBACK"); throw err; }
-  return { ok: true, rebuilt: true, counts: { claims: claimRows.length, entities: entityRows.length, aliases: aliasRows.length, beliefs: resolvedBeliefRows.length, episodes: episodeRows.length, open_loops: dedupedOpenLoopRows.length, contradictions: contradictions.length, syntheses: synthesisRows.length } };
+  const linkStats = rebuildEntityLinks(db, now);
+  return { ok: true, rebuilt: true, counts: { claims: claimRows.length, entities: mergedRows.entityRows.length, aliases: mergedRows.aliasRows.length, beliefs: mergedRows.beliefRows.length, episodes: mergedRows.episodeRows.length, open_loops: mergedRows.openLoopRows.length, contradictions: contradictions.length, syntheses: mergedRows.synthesisRows.length, links: linkStats.linkCount } };
+};
+
+function inferLinkRecordType(recordId: string, sourceLayer = ""): string {
+  const normalizedId = String(recordId || "").trim();
+  const normalizedLayer = String(sourceLayer || "").trim().toLowerCase();
+  if (normalizedLayer === "lcm_summary" || normalizedId.startsWith("sum_")) return "summary";
+  if (normalizedId.startsWith("file_")) return "file";
+  if (normalizedId.startsWith("mem_")) return "memory";
+  return normalizedLayer === "lcm_summary" ? "summary" : "memory";
+}
+
+function insertEntityLink(
+  linkMap: Map<string, Record<string, unknown>>,
+  params: {
+    entityId: string;
+    recordType: string;
+    recordId: string;
+    source: string;
+    confidence?: number;
+    payload?: Record<string, unknown>;
+    now: string;
+  },
+): void {
+  const entityId = String(params.entityId || "").trim();
+  const recordType = String(params.recordType || "").trim();
+  const recordId = String(params.recordId || "").trim();
+  if (!entityId || !recordType || !recordId) return;
+  const key = `${entityId}|${recordType}|${recordId}`;
+  const existing = linkMap.get(key);
+  const nextConfidence = clamp01(params.confidence ?? 0.7);
+  const payload = params.payload || {};
+  if (!existing || Number(existing.confidence || 0) < nextConfidence) {
+    linkMap.set(key, {
+      link_id: `link:${hashNormalized(key)}`,
+      entity_id: entityId,
+      record_type: recordType,
+      record_id: recordId,
+      source: String(params.source || "").trim() || "derived",
+      confidence: nextConfidence,
+      payload,
+      created_at: String(existing?.created_at || params.now),
+      updated_at: params.now,
+    });
+    return;
+  }
+  existing.updated_at = params.now;
+  existing.payload = {
+    ...((existing.payload as Record<string, unknown>) || {}),
+    ...payload,
+  };
+}
+
+export const rebuildEntityLinks = (db: DatabaseSync, now = new Date().toISOString()): { linkCount: number } => {
+  ensureWorldModelStore(db);
+  const linkMap = new Map<string, Record<string, unknown>>();
+
+  const beliefRows = db.prepare(`
+    SELECT belief_id, entity_id, type, source_memory_id, source_layer, source_path, source_line, confidence
+    FROM entity_beliefs
+    WHERE COALESCE(source_memory_id, '') != ''
+  `).all() as Array<Record<string, unknown>>;
+  for (const row of beliefRows) {
+    const recordId = String(row.source_memory_id || "").trim();
+    insertEntityLink(linkMap, {
+      entityId: String(row.entity_id || ""),
+      recordType: inferLinkRecordType(recordId, String(row.source_layer || "")),
+      recordId,
+      source: "belief_source",
+      confidence: Number(row.confidence || 0.7),
+      payload: {
+        belief_id: row.belief_id,
+        belief_type: row.type,
+        source_layer: row.source_layer,
+        source_path: row.source_path,
+        source_line: row.source_line,
+      },
+      now,
+    });
+  }
+
+  const episodeRows = db.prepare(`
+    SELECT episode_id, primary_entity_id, source_memory_ids, payload
+    FROM entity_episodes
+  `).all() as Array<Record<string, unknown>>;
+  for (const row of episodeRows) {
+    const recordIds = parseJsonSafe<string[]>(row.source_memory_ids, []);
+    const payload = parseJsonSafe<Record<string, unknown>>(row.payload, {});
+    for (const recordId of recordIds) {
+      insertEntityLink(linkMap, {
+        entityId: String(row.primary_entity_id || ""),
+        recordType: inferLinkRecordType(recordId, String(payload.source_layer || "")),
+        recordId,
+        source: "episode_source",
+        confidence: 0.72,
+        payload: {
+          episode_id: row.episode_id,
+          source_layer: payload.source_layer,
+        },
+        now,
+      });
+    }
+  }
+
+  const openLoopRows = db.prepare(`
+    SELECT loop_id, related_entity_id, source_memory_ids, payload
+    FROM entity_open_loops
+    WHERE COALESCE(related_entity_id, '') != ''
+  `).all() as Array<Record<string, unknown>>;
+  for (const row of openLoopRows) {
+    const recordIds = parseJsonSafe<string[]>(row.source_memory_ids, []);
+    const payload = parseJsonSafe<Record<string, unknown>>(row.payload, {});
+    for (const recordId of recordIds) {
+      insertEntityLink(linkMap, {
+        entityId: String(row.related_entity_id || ""),
+        recordType: inferLinkRecordType(recordId, String(payload.source_layer || "")),
+        recordId,
+        source: "open_loop_source",
+        confidence: 0.66,
+        payload: {
+          loop_id: row.loop_id,
+          source_layer: payload.source_layer,
+        },
+        now,
+      });
+    }
+  }
+
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM entity_links").run();
+    const insert = db.prepare(`
+      INSERT INTO entity_links (
+        link_id, entity_id, record_type, record_id, source, confidence, payload, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const row of linkMap.values()) {
+      insert.run(
+        s$(row.link_id),
+        s$(row.entity_id),
+        s$(row.record_type),
+        s$(row.record_id),
+        s$(row.source),
+        s$(row.confidence),
+        JSON.stringify(row.payload || {}),
+        s$(row.created_at),
+        s$(row.updated_at),
+      );
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  return { linkCount: linkMap.size };
+};
+
+export const listEntityLinks = (
+  db: DatabaseSync,
+  options: { entityId?: string; recordType?: string; limit?: number } = {},
+): Record<string, unknown>[] => {
+  ensureWorldModelStore(db);
+  const entityId = String(options.entityId || "").trim();
+  const recordType = String(options.recordType || "").trim();
+  const limit = Math.max(1, Math.min(2000, Number(options.limit || 500) || 500));
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (entityId) { where.push("entity_id = ?"); params.push(entityId); }
+  if (recordType) { where.push("record_type = ?"); params.push(recordType); }
+  const rows = db.prepare(`
+    SELECT link_id, entity_id, record_type, record_id, source, confidence, payload, created_at, updated_at
+    FROM entity_links
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY confidence DESC, updated_at DESC, record_type ASC
+    LIMIT ?
+  `).all(...params, limit) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    ...row,
+    payload: parseJsonSafe(row.payload, {}),
+  }));
+};
+
+export const mergeEntities = ({
+  db,
+  winnerEntityId,
+  loserEntityId,
+  reason = "",
+  config = {} as Record<string, unknown>,
+  now = new Date().toISOString(),
+}: {
+  db: DatabaseSync;
+  winnerEntityId: string;
+  loserEntityId: string;
+  reason?: string;
+  config?: Record<string, unknown>;
+  now?: string;
+}): Record<string, unknown> => {
+  ensureWorldModelStore(db);
+  const overrides = loadEntityMergeOverrides(db);
+  const winnerResolved = resolveMergedEntityId(winnerEntityId, overrides);
+  const loserResolved = resolveMergedEntityId(loserEntityId, overrides);
+  if (!winnerResolved || !loserResolved) {
+    throw new Error("winnerEntityId and loserEntityId are required");
+  }
+  if (winnerResolved === loserResolved) {
+    return {
+      ok: true,
+      winnerEntityId: winnerResolved,
+      loserEntityId: loserResolved,
+      alreadyMerged: true,
+      result: rebuildWorldModel({ db, config, now }),
+    };
+  }
+
+  const winner = db.prepare(`
+    SELECT entity_id, kind, display_name
+    FROM entities
+    WHERE entity_id = ?
+    LIMIT 1
+  `).get(winnerResolved) as Record<string, unknown> | undefined;
+  const loser = db.prepare(`
+    SELECT entity_id, kind, display_name
+    FROM entities
+    WHERE entity_id = ?
+    LIMIT 1
+  `).get(loserResolved) as Record<string, unknown> | undefined;
+  if (!winner) throw new Error(`winner entity not found: ${winnerResolved}`);
+  if (!loser) throw new Error(`loser entity not found: ${loserResolved}`);
+  if (String(winner.kind || "").trim() && String(loser.kind || "").trim() && String(winner.kind) !== String(loser.kind)) {
+    throw new Error(`cannot merge different entity kinds: ${winner.kind} vs ${loser.kind}`);
+  }
+
+  db.prepare(`
+    INSERT INTO entity_merge_overrides (
+      loser_entity_id, winner_entity_id, reason, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(loser_entity_id) DO UPDATE SET
+      winner_entity_id = excluded.winner_entity_id,
+      reason = excluded.reason,
+      updated_at = excluded.updated_at
+  `).run(loserResolved, winnerResolved, reason || null, now, now);
+
+  const result = rebuildWorldModel({ db, config, now });
+  return {
+    ok: true,
+    winnerEntityId: winnerResolved,
+    loserEntityId: loserResolved,
+    winnerDisplayName: winner.display_name,
+    loserDisplayName: loser.display_name,
+    reason: reason || null,
+    result,
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -1538,10 +2099,88 @@ export const findEntityMatches = (db: DatabaseSync, query: unknown, options: { l
   return Array.from(deduped.values()).sort((a, b) => b.score - a.score || a.display_name.localeCompare(b.display_name)).slice(0, limit);
 };
 
+export const listEntityMergeSuggestions = (
+  db: DatabaseSync,
+  options: { limit?: number; minScore?: number } = {},
+): Array<Record<string, unknown>> => {
+  ensureWorldModelStore(db);
+  const rows = db
+    .prepare(
+      `SELECT entity_id, kind, display_name, normalized_name, aliases, confidence
+       FROM entities
+       WHERE status = 'active'
+       ORDER BY confidence DESC, updated_at DESC`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const minScore = Math.max(0.6, Math.min(0.99, Number(options.minScore || 0.82) || 0.82));
+  const limit = Math.max(1, Math.min(50, Number(options.limit || 12) || 12));
+  const suggestions: Array<Record<string, unknown>> = [];
+
+  const candidateNames = (row: Record<string, unknown>): string[] => {
+    const aliases = parseJsonSafe<unknown[]>(row.aliases, [])
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => normalizeContent(value))
+      .filter(Boolean);
+    return Array.from(
+      new Set(
+        [String(row.display_name || ""), String(row.normalized_name || ""), ...aliases]
+          .map((value) => normalizeContent(value))
+          .filter(Boolean),
+      ),
+    );
+  };
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const left = rows[i];
+    const leftKind = String(left.kind || "");
+    const leftNames = candidateNames(left);
+    if (leftNames.length === 0) continue;
+    for (let j = i + 1; j < rows.length; j += 1) {
+      const right = rows[j];
+      const rightKind = String(right.kind || "");
+      if (leftKind && rightKind && leftKind !== rightKind) continue;
+      const rightNames = candidateNames(right);
+      if (rightNames.length === 0) continue;
+      let bestScore = 0;
+      for (const leftName of leftNames) {
+        for (const rightName of rightNames) {
+          const score = overlapSimilarity(leftName, rightName);
+          bestScore = Math.max(bestScore, score);
+          if (leftName === rightName) {
+            bestScore = Math.max(bestScore, 0.99);
+          }
+        }
+      }
+      if (bestScore < minScore) continue;
+      suggestions.push({
+        left_entity_id: left.entity_id,
+        left_display_name: left.display_name,
+        right_entity_id: right.entity_id,
+        right_display_name: right.display_name,
+        kind: leftKind || rightKind || "entity",
+        score: Number(bestScore.toFixed(4)),
+      });
+      if (suggestions.length >= limit) {
+        return suggestions;
+      }
+    }
+  }
+
+  return suggestions;
+};
+
 export const getEntityDetail = (db: DatabaseSync, entityId: string): Record<string, unknown> | null => {
   ensureWorldModelStore(db);
   const row = db.prepare(`SELECT entity_id, kind, display_name, normalized_name, status, confidence, aliases, created_at, updated_at, payload FROM entities WHERE entity_id = ? LIMIT 1`).get(String(entityId || "")) as Record<string, unknown> | undefined;
   const entity = row ? { ...row, aliases: parseJsonSafe<unknown[]>(row.aliases, []), payload: parseJsonSafe<Record<string, unknown>>(row.payload, {}) } as Record<string, unknown> : null;
   if (!entity) return null;
-  return { ...entity, aliases: listEntityAliases(db, String(entity.entity_id || "")).map((row) => row.alias), beliefs: listBeliefs(db, { entityId: String(entity.entity_id || ""), limit: 200 }), episodes: listEpisodes(db, { entityId: String(entity.entity_id || ""), limit: 100 }), open_loops: listOpenLoops(db, { entityId: String(entity.entity_id || ""), limit: 100 }), syntheses: listSyntheses(db, { subjectType: "entity", subjectId: String(entity.entity_id || ""), limit: 20 }) };
+  return {
+    ...entity,
+    aliases: listEntityAliases(db, String(entity.entity_id || "")).map((row) => row.alias),
+    beliefs: listBeliefs(db, { entityId: String(entity.entity_id || ""), limit: 200 }),
+    episodes: listEpisodes(db, { entityId: String(entity.entity_id || ""), limit: 100 }),
+    open_loops: listOpenLoops(db, { entityId: String(entity.entity_id || ""), limit: 100 }),
+    syntheses: listSyntheses(db, { subjectType: "entity", subjectId: String(entity.entity_id || ""), limit: 20 }),
+    links: listEntityLinks(db, { entityId: String(entity.entity_id || ""), limit: 200 }),
+  };
 };

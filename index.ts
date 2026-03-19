@@ -30,7 +30,9 @@ import {
   createMemoryNamespaceStatusTool,
 } from "./src/surface/episodic-tools.js";
 import {
+  createEngramStatusTool,
   createEntityGetTool,
+  createEntityMergeTool,
   createGradientScoreTool,
   createMemoryGetTool,
   createOpsStatusTool,
@@ -40,6 +42,7 @@ import {
   captureMemoryNotesFromAgentEnd,
   sanitizeMemoryNoteMessage,
 } from "./src/memory/capture.js";
+import { buildProactiveMemoryContext } from "./src/memory/proactive-context.js";
 import { ensureMemoryTables } from "./src/memory/memory-schema.js";
 import { ensureMemoryVectorTables } from "./src/memory/vector-search.js";
 import {
@@ -54,11 +57,16 @@ import { createLcmExpandQueryTool } from "./src/surface/lcm-expand-query-tool.js
 import { createLcmExpandTool } from "./src/surface/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/surface/lcm-grep-tool.js";
 import { createMemoryAddTool } from "./src/surface/memory-add-tool.js";
+import {
+  createMemoryCorrectTool,
+  createMemoryRetractTool,
+} from "./src/surface/memory-mutation-tools.js";
 import { createMemoryQueryTool } from "./src/surface/memory-query-tool.js";
 import { createMemoryRecallTool } from "./src/surface/memory-recall-tool.js";
 import { createMemorySearchTool } from "./src/surface/memory-search-tool.js";
 import { createMemoryWorldTool } from "./src/surface/memory-world-tool.js";
 import { registerLcmHttpRoutes } from "./src/surface/http-routes.js";
+import { buildVaultSurface } from "./src/surface/vault-mirror.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1552,6 +1560,27 @@ const lcmPlugin = {
         }
         return undefined;
       });
+      eventApi.on("before_agent_start", async (event: { prompt?: unknown }) => {
+        const prompt = typeof event.prompt === "string" ? event.prompt.trim() : "";
+        if (!prompt) {
+          return undefined;
+        }
+        try {
+          const prependContext = await buildProactiveMemoryContext({
+            db: getLcmConnection(deps.config.databasePath),
+            config: deps.config,
+            prompt,
+          });
+          return prependContext ? { prependContext } : undefined;
+        } catch (err) {
+          api.logger.warn(
+            `[engram] proactive memory injection error: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          return undefined;
+        }
+      });
       eventApi.on(
         "agent_end",
         async (event: { messages: unknown[] }, ctx: { agentId?: string; sessionKey?: string }) => {
@@ -1585,16 +1614,34 @@ const lcmPlugin = {
         resolveAgentDir: deps.resolveAgentDir,
       }),
     );
+    api.registerTool((ctx) =>
+      createMemoryRetractTool({
+        config: deps.config,
+        deps,
+        sessionKey: ctx.sessionKey,
+        resolveAgentDir: deps.resolveAgentDir,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createMemoryCorrectTool({
+        config: deps.config,
+        deps,
+        sessionKey: ctx.sessionKey,
+        resolveAgentDir: deps.resolveAgentDir,
+      }),
+    );
     api.registerTool(() => createMemoryRecallTool({ config: deps.config }));
     api.registerTool(() => createMemorySearchTool({ config: deps.config }));
     api.registerTool(() => createMemoryQueryTool({ config: deps.config }));
     api.registerTool(() => createMemoryWorldTool({ config: deps.config }));
     api.registerTool(() => createMemoryGetTool({ config: deps.config }));
     api.registerTool(() => createEntityGetTool({ config: deps.config }));
+    api.registerTool(() => createEntityMergeTool({ config: deps.config }));
     api.registerTool(() => createMemoryGetEntityTool({ config: deps.config }));
     api.registerTool(() => createMemoryGetEpisodeTool({ config: deps.config }));
     api.registerTool(() => createVaultQueryTool({ config: deps.config }));
     api.registerTool(() => createOpsStatusTool({ config: deps.config }));
+    api.registerTool(() => createEngramStatusTool({ config: deps.config }));
     api.registerTool(() => createMemoryNamespaceStatusTool({ config: deps.config }));
     api.registerTool((ctx) =>
       createMemoryListAgentsTool({
@@ -1615,6 +1662,71 @@ const lcmPlugin = {
     api.registerTool(() => createGradientScoreTool({ config: deps.config }));
     api.registerTool(() => createAlignmentCheckTool({ config: deps.config }));
     api.registerTool(() => createAlignmentDriftTool({ config: deps.config }));
+    api.registerCli(
+      ({ program }) => {
+        const engram = program
+          .command("engram")
+          .description("Engram memory and context diagnostics");
+
+        engram
+          .command("status")
+          .description("Show Engram health and rollout readiness")
+          .action(async () => {
+            const status = await createOpsStatusTool({ config: deps.config }).execute(
+              "engram:status",
+              {},
+            );
+            console.log(JSON.stringify(status.details, null, 2));
+          });
+
+        engram
+          .command("db-stats")
+          .description("Show core Engram database table counts")
+          .action(() => {
+            const rows = db
+              .prepare(
+                `SELECT
+                   (SELECT COUNT(*) FROM memory_current) AS memory_current,
+                   (SELECT COUNT(*) FROM memory_triggers) AS memory_triggers,
+                   (SELECT COUNT(*) FROM memory_events) AS memory_events,
+                   (SELECT COUNT(*) FROM summaries) AS summaries,
+                   (SELECT COUNT(*) FROM conversations) AS conversations,
+                   (SELECT COUNT(*) FROM entities) AS entities`,
+              )
+              .get() as Record<string, unknown>;
+            console.log(JSON.stringify(rows, null, 2));
+          });
+
+        engram
+          .command("vault-sync")
+          .description("Force a vault mirror rebuild")
+          .option("--dry-run", "Render without writing files")
+          .action((opts: { dryRun?: boolean }) => {
+            const summary = buildVaultSurface({
+              db,
+              config: deps.config,
+              dryRun: opts.dryRun === true,
+            });
+            console.log(JSON.stringify(summary, null, 2));
+          });
+
+        engram
+          .command("compact <sessionId> <sessionFile>")
+          .description("Force manual compaction for a session")
+          .option("--token-budget <n>", "Context budget to compact against", "32000")
+          .action(async (sessionId: string, sessionFile: string, opts: { tokenBudget?: string }) => {
+            const tokenBudget = Number(opts.tokenBudget || "32000");
+            const result = await lcm.compact({
+              sessionId,
+              sessionFile,
+              tokenBudget: Number.isFinite(tokenBudget) && tokenBudget > 0 ? tokenBudget : 32000,
+              force: true,
+            });
+            console.log(JSON.stringify(result, null, 2));
+          });
+      },
+      { commands: ["engram"] },
+    );
 
     api.logger.info(
       `[engram] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,

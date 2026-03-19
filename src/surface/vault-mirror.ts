@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
+import { listEntityMergeSuggestions } from "../entity/world-model.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -77,6 +78,10 @@ export type VaultBuildSummary = {
   copied_files: number;
   skipped_unchanged: number;
   removed_files: number;
+  merge_suggestions?: {
+    count: number;
+    suggestions: Array<Record<string, unknown>>;
+  };
   freshness: VaultFreshness;
   manifest: VaultManifest;
   surface_summary_path: string;
@@ -89,6 +94,7 @@ export type VaultHealthReport = {
   enabled: boolean;
   vault_root: string;
   mirror_root: string;
+  subdir: string;
   session: {
     last_session_at: string | null;
     stale: boolean;
@@ -96,6 +102,16 @@ export type VaultHealthReport = {
   vault: {
     last_built_at: string | null;
     stale: boolean;
+    run_id?: string | null;
+    items_synced?: number;
+    skipped_unchanged?: number;
+    removed_files?: number;
+    generated_files?: number;
+    failures?: string[];
+    merge_suggestions?: {
+      count: number;
+      suggestions: Array<Record<string, unknown>>;
+    };
   };
   manual_protection: {
     ok: boolean;
@@ -334,8 +350,38 @@ const resolveMirrorRoot = (
   config: LcmConfig,
 ): { vaultRoot: string; subdir: string; mirrorRoot: string } => {
   const vaultRoot = String(config.vaultPath || "").trim();
-  const subdir = String(config.vaultSubdir || "Engram").trim() || "Engram";
-  return { vaultRoot, subdir, mirrorRoot: path.join(vaultRoot, subdir) };
+  const rawSubdir = String(config.vaultSubdir || "Engram").trim() || "Engram";
+  const normalizedSubdir = rawSubdir
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .trim() || "Engram";
+  if (
+    normalizedSubdir === "." ||
+    normalizedSubdir === ".." ||
+    normalizedSubdir.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new Error(`Invalid vault subdir: ${rawSubdir}`);
+  }
+  if (vaultRoot) {
+    const rootBase = path.basename(path.resolve(vaultRoot)).trim().toLowerCase();
+    const subdirLeaf = normalizedSubdir.split("/").pop()?.trim().toLowerCase() || "";
+    if (rootBase && subdirLeaf && rootBase === subdirLeaf) {
+      throw new Error(
+        `Vault root ${vaultRoot} already ends with ${subdirLeaf}; refusing recursive ${normalizedSubdir} nesting.`,
+      );
+    }
+  }
+  const mirrorRoot = path.join(vaultRoot, normalizedSubdir);
+  if (vaultRoot && fs.existsSync(vaultRoot) && fs.existsSync(mirrorRoot)) {
+    const realVaultRoot = fs.realpathSync(vaultRoot);
+    const realMirrorRoot = fs.realpathSync(mirrorRoot);
+    if (realVaultRoot === realMirrorRoot) {
+      throw new Error(
+        `Vault mirror path resolves back to the vault root (${realVaultRoot}); refusing circular sync target.`,
+      );
+    }
+  }
+  return { vaultRoot, subdir: normalizedSubdir, mirrorRoot };
 };
 
 const resolveManualFolders = (config: LcmConfig): string[] => {
@@ -1028,6 +1074,7 @@ export const renderVaultBuildMarkdown = ({
   lines.push(`- copied_files: ${Number(summary?.copied_files || 0)}`);
   lines.push(`- skipped_unchanged: ${Number(summary?.skipped_unchanged || 0)}`);
   lines.push(`- removed_files: ${Number(summary?.removed_files || 0)}`);
+  lines.push(`- merge_suggestions: ${Number(summary?.merge_suggestions?.count || 0)}`);
   lines.push("");
   lines.push("## Freshness");
   lines.push("");
@@ -1044,6 +1091,18 @@ export const renderVaultBuildMarkdown = ({
     `- vault_stale: ${summary?.freshness?.vault?.stale === true}`,
   );
   lines.push("");
+  if (Number(summary?.merge_suggestions?.count || 0) > 0) {
+    lines.push("## Entity Merge Suggestions");
+    lines.push("");
+    for (const suggestion of summary?.merge_suggestions?.suggestions || []) {
+      lines.push(
+        `- ${String(suggestion.left_display_name || suggestion.left_entity_id || "unknown")} <-> ${String(
+          suggestion.right_display_name || suggestion.right_entity_id || "unknown",
+        )} (score=${Number(suggestion.score || 0).toFixed(3)})`,
+      );
+    }
+    lines.push("");
+  }
   return `${lines.join("\n")}\n`;
 };
 
@@ -1062,6 +1121,7 @@ export const renderVaultDoctorMarkdown = ({
   lines.push(`- last_vault_built_at: ${health.vault.last_built_at || "none"}`);
   lines.push(`- session_stale: ${health.session.stale}`);
   lines.push(`- vault_stale: ${health.vault.stale}`);
+  lines.push(`- merge_suggestions: ${Number(health.vault.merge_suggestions?.count || 0)}`);
   lines.push(
     `- manual_folder_protection_ok: ${health.manual_protection.ok}`,
   );
@@ -1187,6 +1247,10 @@ export const buildVaultSurface = ({
     copied_files: 0,
     skipped_unchanged: 0,
     removed_files: 0,
+    merge_suggestions: {
+      count: 0,
+      suggestions: [],
+    },
     freshness: {
       session: { last_session_at: null, stale: true },
       vault: { last_built_at: null, stale: true },
@@ -1223,6 +1287,13 @@ export const buildVaultSurface = ({
     const allSummaries = queryAllSummaries(ctx.db);
     const { leaf: leafCount, condensed: condensedCount } = queryKindCounts(ctx.db);
     const lastSessionAt = queryLatestSessionAt(ctx.db);
+    const entityMergeSuggestions = (() => {
+      try {
+        return listEntityMergeSuggestions(ctx.db, { limit: 10 });
+      } catch {
+        return [];
+      }
+    })();
 
     // Memory & entity data (graceful — tables may not exist)
     const memoryNodes = queryMemoryNodes(ctx.db);
@@ -1429,6 +1500,10 @@ export const buildVaultSurface = ({
       copied_files: writer.copied,
       skipped_unchanged: writer.skipped,
       removed_files: writer.removed,
+      merge_suggestions: {
+        count: entityMergeSuggestions.length,
+        suggestions: entityMergeSuggestions,
+      },
       freshness,
       manifest,
       surface_summary_path: "",
@@ -1531,28 +1606,45 @@ export const inspectVaultHealth = ({
       Date.parse(String(existing.freshness?.session?.last_session_at || "")) || 0;
     const buildLastMs =
       Date.parse(String(existing.freshness?.vault?.last_built_at || existing.generated_at || "")) || 0;
-    return {
-      enabled: config.vaultEnabled,
-      vault_root: vaultRoot,
-      mirror_root: mirrorRoot,
-      session: {
-        last_session_at: existing.freshness?.session?.last_session_at ?? null,
-        stale:
-          lastSessionMs > 0
+      return {
+        enabled: config.vaultEnabled,
+        vault_root: vaultRoot,
+        mirror_root: mirrorRoot,
+        subdir: existing.subdir || config.vaultSubdir || "Engram",
+        session: {
+          last_session_at: existing.freshness?.session?.last_session_at ?? null,
+          stale:
+            lastSessionMs > 0
             ? Date.now() - lastSessionMs > daysToMs(7)
             : true,
       },
-      vault: {
-        last_built_at:
-          existing.freshness?.vault?.last_built_at ?? existing.generated_at ?? null,
-        stale:
-          buildLastMs > 0
-            ? Date.now() - buildLastMs > daysToMs(STALE_VAULT_DAYS)
-            : true,
-      },
-      manual_protection: { ok: manualIssues.length === 0, issues: manualIssues },
-      summary_path: summaryFilePath,
-    };
+        vault: {
+          last_built_at:
+            existing.freshness?.vault?.last_built_at ?? existing.generated_at ?? null,
+          stale:
+            buildLastMs > 0
+              ? Date.now() - buildLastMs > daysToMs(STALE_VAULT_DAYS)
+              : true,
+          run_id: existing.run_id ?? null,
+          items_synced: Number(existing.copied_files || 0),
+          skipped_unchanged: Number(existing.skipped_unchanged || 0),
+          removed_files: Number(existing.removed_files || 0),
+          generated_files: Array.isArray(existing.manifest?.generated_files)
+            ? existing.manifest.generated_files.length
+            : 0,
+          merge_suggestions: existing.merge_suggestions
+            ? {
+                count: Number(existing.merge_suggestions.count || 0),
+                suggestions: Array.isArray(existing.merge_suggestions.suggestions)
+                  ? existing.merge_suggestions.suggestions
+                  : [],
+              }
+            : undefined,
+          failures: manualIssues.length > 0 ? [...manualIssues] : [],
+        },
+        manual_protection: { ok: manualIssues.length === 0, issues: manualIssues },
+        summary_path: summaryFilePath,
+      };
   }
 
   // Fallback: query DB directly
@@ -1572,6 +1664,7 @@ export const inspectVaultHealth = ({
       enabled: config.vaultEnabled,
       vault_root: vaultRoot,
       mirror_root: mirrorRoot,
+      subdir: config.vaultSubdir || "Engram",
       session: {
         last_session_at: lastSessionAt,
         stale:
@@ -1586,6 +1679,16 @@ export const inspectVaultHealth = ({
           buildLastMs > 0
             ? Date.now() - buildLastMs > daysToMs(STALE_VAULT_DAYS)
             : true,
+        run_id: null,
+        items_synced: 0,
+        skipped_unchanged: 0,
+        removed_files: 0,
+        generated_files: 0,
+        merge_suggestions: {
+          count: 0,
+          suggestions: [],
+        },
+        failures: manualIssues.length > 0 ? [...manualIssues] : [],
       },
       manual_protection: { ok: manualIssues.length === 0, issues: manualIssues },
       summary_path: summaryFilePath,

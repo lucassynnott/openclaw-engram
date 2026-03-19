@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
-import { resolveMemoryNamespaceFromSessionContext } from "../memory/agent-namespace.js";
+import { ensureWorldModelReady, findEntityMatches } from "../entity/world-model.js";
+import { resolveSourceAgentIdFromSessionContext } from "../memory/agent-namespace.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
+import { upsertMemoryTrigger } from "../memory/memory-triggers.js";
 import {
   reindexNativeMemoryLayer,
   syncNativeMemoryLayer,
@@ -44,6 +46,30 @@ const MemoryAddSchema = Type.Object({
   entities: Type.Optional(
     Type.Array(Type.String(), {
       description: "Named entities to associate with this memory.",
+    }),
+  ),
+  confidence: Type.Optional(
+    Type.Number({
+      description: "Optional confidence override between 0 and 1.",
+      minimum: 0,
+      maximum: 1,
+    }),
+  ),
+  dedupeMode: Type.Optional(
+    Type.String({
+      description: "Duplicate handling mode. Defaults to global semantic dedupe.",
+      enum: ["none", "global", "session"],
+    }),
+  ),
+  triggerPattern: Type.Optional(
+    Type.String({
+      description:
+        "Optional proactive trigger. If future prompts match this pattern, Engram surfaces the memory automatically.",
+    }),
+  ),
+  triggerPatterns: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "Optional additional proactive trigger patterns for this memory.",
     }),
   ),
 });
@@ -94,6 +120,9 @@ export type StoreMemoryResult = {
 type MemoryColumnInfo = {
   name?: string;
 };
+
+const SEMANTIC_DEDUPE_THRESHOLD = 0.8;
+const SEMANTIC_DEDUPE_SCAN_LIMIT = 120;
 
 function resolveConfidence(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -154,6 +183,110 @@ function findDuplicateMemoryId(params: {
   return typeof row?.memory_id === "string" ? row.memory_id : undefined;
 }
 
+function tokenizeNormalized(text: string): string[] {
+  return normalizeContent(text)
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+}
+
+function overlapSimilarity(left: string, right: string): number {
+  const leftTokens = new Set(tokenizeNormalized(left));
+  const rightTokens = new Set(tokenizeNormalized(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) {
+    return 0;
+  }
+
+  let intersection = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) {
+      intersection += 1;
+    }
+  }
+
+  const union = new Set([...leftTokens, ...rightTokens]).size || 1;
+  const overlap = intersection / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+  const jaccard = intersection / union;
+  return Math.max(overlap, jaccard);
+}
+
+function findSemanticDuplicate(params: {
+  db: ReturnType<typeof getLcmConnection>;
+  content: string;
+  scope: string;
+  kind: MemoryKind;
+  sourceSession?: string;
+  dedupeMode: "none" | "global" | "session";
+}): { memoryId: string; similarity: number } | undefined {
+  if (params.dedupeMode === "none") {
+    return undefined;
+  }
+
+  const where = ["status = 'active'", "scope = ?", "type = ?"];
+  const queryParams: Array<string | number> = [params.scope, params.kind];
+  if (params.dedupeMode === "session" && params.sourceSession) {
+    where.push("COALESCE(source_session, '') = ?");
+    queryParams.push(params.sourceSession);
+  }
+
+  const rows = params.db
+    .prepare(
+      `SELECT memory_id, content
+       FROM memory_current
+       WHERE ${where.join(" AND ")}
+       ORDER BY COALESCE(content_time, updated_at, created_at) DESC, updated_at DESC
+       LIMIT ?`,
+    )
+    .all(...queryParams, SEMANTIC_DEDUPE_SCAN_LIMIT) as Array<{
+    memory_id?: string;
+    content?: string;
+  }>;
+
+  let best: { memoryId: string; similarity: number } | undefined;
+  for (const row of rows) {
+    const similarity = overlapSimilarity(params.content, String(row.content || ""));
+    if (similarity < SEMANTIC_DEDUPE_THRESHOLD) {
+      continue;
+    }
+    if (!best || similarity > best.similarity) {
+      best = {
+        memoryId: String(row.memory_id || ""),
+        similarity,
+      };
+    }
+  }
+
+  return best;
+}
+
+function resolveEntityTags(
+  db: ReturnType<typeof getLcmConnection>,
+  config: LcmConfig,
+  content: string,
+  entities: string[],
+): string[] {
+  const resolved = new Set(
+    entities
+      .map((entity) => entity.trim())
+      .filter(Boolean),
+  );
+
+  try {
+    ensureWorldModelReady({ db, config });
+    const matches = findEntityMatches(db, content, { limit: 4 });
+    for (const match of matches) {
+      const display = String(match.display_name || match.alias || "").trim();
+      if (display) {
+        resolved.add(display);
+      }
+    }
+  } catch {
+    // Auto-linking is best-effort.
+  }
+
+  return [...resolved];
+}
+
 export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
   const content = params.content.trim();
   if (!content) {
@@ -176,6 +309,7 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
   const entities = Array.isArray(params.entities)
     ? params.entities.map((entity) => entity.trim()).filter(Boolean)
     : [];
+  const resolvedEntities = resolveEntityTags(db, params.config, content, entities);
 
   const junkResult = detectJunk(content);
   if (junkResult.junk) {
@@ -220,7 +354,7 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
     scope,
     kind: effectiveKind,
     sourceSession: params.sourceSession,
-    dedupeMode: params.dedupeMode ?? "none",
+    dedupeMode: params.dedupeMode ?? "global",
   });
   if (duplicateOf) {
     return {
@@ -231,9 +365,26 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
       scope,
     };
   }
+  const semanticDuplicate = findSemanticDuplicate({
+    db,
+    content,
+    scope,
+    kind: effectiveKind,
+    sourceSession: params.sourceSession,
+    dedupeMode: params.dedupeMode ?? "global",
+  });
+  if (semanticDuplicate) {
+    return {
+      stored: false,
+      reason: "duplicate_semantic",
+      detail: `${semanticDuplicate.memoryId} (${semanticDuplicate.similarity.toFixed(2)} overlap)`,
+      kind: effectiveKind,
+      scope,
+    };
+  }
   const status = classification.action === "archive" ? "archived" : "active";
   const archivedAt = status === "archived" ? now : null;
-  const tags = entities.length > 0 ? JSON.stringify(entities) : "[]";
+  const tags = resolvedEntities.length > 0 ? JSON.stringify(resolvedEntities) : "[]";
   const provenance =
     params.provenance && typeof params.provenance === "object"
       ? JSON.stringify(params.provenance)
@@ -306,8 +457,8 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
   }
 
   const linkedEntityIds: string[] = [];
-  if (entities.length > 0) {
-    for (const entityName of entities) {
+  if (resolvedEntities.length > 0) {
+    for (const entityName of resolvedEntities) {
       const normalizedName = entityName.toLowerCase().trim();
       const existing = db
         .prepare("SELECT entity_id FROM memory_entities WHERE normalized_name = ? LIMIT 1")
@@ -392,6 +543,7 @@ export function createMemoryAddTool(input: {
           ? String(input.resolveAgentDir() || "").trim()
           : "";
       let nativeSyncWarning: string | null = null;
+      let triggerWarning: string | null = null;
 
       if (nativeRoot) {
         try {
@@ -400,7 +552,7 @@ export function createMemoryAddTool(input: {
             rootDir: nativeRoot,
           });
         } catch (err) {
-          nativeSyncWarning = err instanceof Error ? err.message : String(err);
+          triggerWarning = err instanceof Error ? err.message : String(err);
         }
       }
 
@@ -412,8 +564,14 @@ export function createMemoryAddTool(input: {
         entities: Array.isArray(p.entities)
           ? (p.entities as unknown[]).map((entity) => (typeof entity === "string" ? entity : ""))
           : undefined,
+        confidence: typeof p.confidence === "number" ? p.confidence : undefined,
+        dedupeMode:
+          typeof p.dedupeMode === "string"
+          && ["none", "global", "session"].includes(p.dedupeMode)
+            ? (p.dedupeMode as "none" | "global" | "session")
+            : "global",
         source: "manual",
-        sourceAgent: resolveMemoryNamespaceFromSessionContext({
+        sourceAgent: resolveSourceAgentIdFromSessionContext({
           deps: input.deps,
           sessionKey: input.sessionKey,
         }),
@@ -421,7 +579,49 @@ export function createMemoryAddTool(input: {
         component: "memory_add",
       });
       if (!details.stored) {
-        return jsonResult(details);
+        const lines = [
+          "## Memory not stored",
+          "",
+          `**Reason:** ${details.reason || "unknown"}`,
+        ];
+        if (details.gate) lines.push(`**Gate:** ${details.gate}`);
+        if (details.detail) lines.push(`**Detail:** ${details.detail}`);
+        if (details.matchedPattern) lines.push(`**Matched pattern:** ${details.matchedPattern}`);
+        if (details.kind) lines.push(`**Kind:** ${details.kind}`);
+        if (details.scope) lines.push(`**Scope:** ${details.scope}`);
+        if (details.value_label) {
+          lines.push(`**Value:** ${details.value_label} (score: ${details.value_score?.toFixed(3)})`);
+        }
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details,
+        };
+      }
+
+      const triggerPatterns = [
+        typeof p.triggerPattern === "string" ? p.triggerPattern.trim() : "",
+        ...(Array.isArray(p.triggerPatterns)
+          ? (p.triggerPatterns as unknown[])
+              .filter((value): value is string => typeof value === "string")
+              .map((value) => value.trim())
+          : []),
+      ].filter(Boolean);
+      const triggerIds: string[] = [];
+      if (details.memoryId && triggerPatterns.length > 0) {
+        try {
+          const db = getLcmConnection(input.config.databasePath);
+          for (const pattern of triggerPatterns) {
+            const trigger = upsertMemoryTrigger({
+              db,
+              memoryId: String(details.memoryId),
+              pattern,
+              metadata: { created_by: "memory_add" },
+            });
+            triggerIds.push(trigger.triggerId);
+          }
+        } catch (err) {
+          nativeSyncWarning = err instanceof Error ? err.message : String(err);
+        }
       }
 
       let vectorIndexWarning: string | null = null;
@@ -464,6 +664,8 @@ export function createMemoryAddTool(input: {
       if (details.episodeId) lines.push(`**Episode:** \`${details.episodeId}\``);
       if ((details.entityIds?.length ?? 0) > 0) lines.push(`**Entities linked:** ${details.entityIds?.length}`);
       if (nativeSync) lines.push(`**Native sync:** wrote ${nativeSync.filesWritten} files`);
+      if (triggerIds.length > 0) lines.push(`**Triggers:** ${triggerIds.length} proactive patterns registered`);
+      if (triggerWarning) lines.push(`**Trigger warning:** ${triggerWarning}`);
       if (nativeSyncWarning) lines.push(`**Native sync warning:** ${nativeSyncWarning}`);
       if (vectorIndexWarning) lines.push(`**Vector indexing warning:** ${vectorIndexWarning}`);
       if (details.status === "archived") {
@@ -476,8 +678,10 @@ export function createMemoryAddTool(input: {
         details: {
           ...details,
           nativeSync,
+          triggerWarning,
           nativeSyncWarning,
           vectorIndexWarning,
+          triggerIds,
         },
       };
     },

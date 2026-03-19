@@ -133,6 +133,39 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(requestOptions.reasoning).toBeUndefined();
   });
 
+  it("preserves structured technical identifiers in the returned summary", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [{ type: "text", text: "Gateway restart completed and the fix landed." }],
+      })),
+    });
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    const summary = await summarize!(
+      [
+        "Ran: openclaw gateway restart",
+        "Config path: ~/.openclaw/openclaw.json",
+        "Commit: c71cf72",
+        "Error: ENOENT: no such file or directory",
+        "Docs: https://github.com/lucassynnott/openclaw-engram",
+      ].join("\n"),
+      false,
+    );
+
+    expect(summary).toContain("Key technical identifiers:");
+    expect(summary).toContain("openclaw gateway restart");
+    expect(summary).toContain("~/.openclaw/openclaw.json");
+    expect(summary).toContain("c71cf72");
+    expect(summary).toContain("ENOENT: no such file or directory");
+    expect(summary).toContain("https://github.com/lucassynnott/openclaw-engram");
+  });
+
   it("passes resolved API key to completion calls", async () => {
     const deps = makeDeps({
       getApiKey: vi.fn(async () => "resolved-api-key"),

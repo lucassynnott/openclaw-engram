@@ -29,7 +29,7 @@ const DELEGATED_REPLY_POLL_ATTEMPTS = 5;
 const DELEGATED_REPLY_POLL_DELAY_MS = 250;
 const LOCAL_FALLBACK_MAX_DEPTH = 3;
 
-const LcmExpandQuerySchema = Type.Object({
+const LcmExpandQueryRequestSchema = Type.Object({
   summaryIds: Type.Optional(
     Type.Array(Type.String(), {
       description: "Summary IDs to expand (sum_xxx). Required when query is not provided.",
@@ -70,6 +70,19 @@ const LcmExpandQuerySchema = Type.Object({
     }),
   ),
 });
+
+const LcmExpandQuerySchema = Type.Intersect([
+  LcmExpandQueryRequestSchema,
+  Type.Object({
+    queries: Type.Optional(
+      Type.Array(LcmExpandQueryRequestSchema, {
+        description:
+          "Optional batch mode. Run multiple lcm_expand_query requests in parallel and return one result per item.",
+        minItems: 1,
+      }),
+    ),
+  }),
+]);
 
 type ExpandQueryReply = {
   answer: string;
@@ -538,6 +551,46 @@ export function createLcmExpandQueryTool(input: {
     parameters: LcmExpandQuerySchema,
     async execute(_toolCallId, params) {
       const p = params as Record<string, unknown>;
+      const batchQueries = Array.isArray(p.queries)
+        ? p.queries.filter(
+            (entry): entry is Record<string, unknown> => !!entry && typeof entry === "object",
+          )
+        : [];
+      if (batchQueries.length > 0) {
+        const nestedTool = createLcmExpandQueryTool(input);
+        const results = await Promise.all(
+          batchQueries.map(async (entry, index) => {
+            const nestedParams: Record<string, unknown> = { ...entry };
+            delete nestedParams.queries;
+            const nested = await nestedTool.execute(`${_toolCallId}:batch:${index}`, nestedParams);
+            const details =
+              nested.details && typeof nested.details === "object"
+                ? (nested.details as Record<string, unknown>)
+                : {};
+            return {
+              index,
+              prompt: typeof entry.prompt === "string" ? entry.prompt.trim() : "",
+              query: typeof entry.query === "string" ? entry.query.trim() : undefined,
+              summaryIds: normalizeSummaryIds(
+                Array.isArray(entry.summaryIds)
+                  ? entry.summaryIds.filter((value): value is string => typeof value === "string")
+                  : undefined,
+              ),
+              ok: !(typeof details.error === "string" && details.error.trim()),
+              result: details,
+            };
+          }),
+        );
+        const failedQueries = results.filter((result) => !result.ok).length;
+        return jsonResult({
+          batched: true,
+          totalQueries: results.length,
+          completedQueries: results.length - failedQueries,
+          failedQueries,
+          results,
+        });
+      }
+
       const explicitSummaryIds = normalizeSummaryIds(p.summaryIds as string[] | undefined);
       const query = typeof p.query === "string" ? p.query.trim() : "";
       const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";

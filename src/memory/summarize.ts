@@ -31,6 +31,8 @@ const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
+const STRUCTURED_ITEM_LIMIT = 6;
+const STRUCTURED_LINE_LIMIT = 8;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -206,6 +208,151 @@ function truncateDiagnosticText(value: string, maxChars = DIAGNOSTIC_MAX_CHARS):
     return value;
   }
   return `${value.slice(0, maxChars)}...[truncated:${value.length - maxChars} chars]`;
+}
+
+function collectUniqueMatches(text: string, pattern: RegExp, limit = STRUCTURED_ITEM_LIMIT): string[] {
+  const matches = new Set<string>();
+  const source = text || "";
+  const re = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+  let match = re.exec(source);
+  while (match && matches.size < limit) {
+    const value = String(match[0] || "").trim();
+    if (value) {
+      matches.add(value);
+    }
+    match = re.exec(source);
+  }
+  return [...matches];
+}
+
+function collectImportantLines(text: string, limit = STRUCTURED_LINE_LIMIT): string[] {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        /(?:error|exception|failed|enoent|eaddrinuse|database is locked|permission denied|not registered|timed out)/i.test(
+          line,
+        ) ||
+        /(?:^[$>#]\s*\S|(?:^|\s)(?:openclaw|git|npm|pnpm|yarn|node|python|cargo|go|uv|docker|systemctl)\b)/i.test(
+          line,
+        ),
+    )
+    .slice(0, limit);
+}
+
+type StructuredArtifacts = {
+  commands: string[];
+  paths: string[];
+  urls: string[];
+  hashes: string[];
+  configValues: string[];
+  errorLines: string[];
+};
+
+function extractStructuredArtifacts(text: string): StructuredArtifacts {
+  const commands = collectImportantLines(text)
+    .filter((line) =>
+      /(?:^[$>#]\s*\S|(?:^|\s)(?:openclaw|git|npm|pnpm|yarn|node|python|cargo|go|uv|docker|systemctl)\b)/i.test(
+        line,
+      ),
+    )
+    .slice(0, STRUCTURED_LINE_LIMIT);
+  const errorLines = collectImportantLines(text)
+    .filter((line) =>
+      /(?:error|exception|failed|enoent|eaddrinuse|database is locked|permission denied|not registered|timed out)/i.test(
+        line,
+      ),
+    )
+    .slice(0, STRUCTURED_LINE_LIMIT);
+  const paths = collectUniqueMatches(
+    text,
+    /(?:~\/|\/)[^\s"'`<>|]+|(?:\.\.?\/)[^\s"'`<>|]+|(?:[A-Za-z0-9._-]+\/)+(?:[A-Za-z0-9._-]+)/g,
+  );
+  const urls = collectUniqueMatches(text, /https?:\/\/[^\s"'`<>]+/g);
+  const hashes = collectUniqueMatches(text, /\b[0-9a-f]{7,40}\b/gi);
+  const configValues = collectUniqueMatches(
+    text,
+    /\b[A-Z][A-Z0-9_]{2,}=(?:"[^"]+"|'[^']+'|[^\s"'`<>]+)|"(?:[^"\\]|\\.)+"\s*:\s*(?:"[^"]+"|true|false|null|-?\d+(?:\.\d+)?)/g,
+  );
+
+  return {
+    commands,
+    paths,
+    urls,
+    hashes,
+    configValues,
+    errorLines,
+  };
+}
+
+function buildStructuredArtifactInstruction(text: string): string {
+  const artifacts = extractStructuredArtifacts(text);
+  const sectionPairs: Array<[string, string[]]> = [
+    ["Commands", artifacts.commands],
+    ["Paths", artifacts.paths],
+    ["URLs", artifacts.urls],
+    ["Hashes", artifacts.hashes],
+    ["Config values", artifacts.configValues],
+    ["Error lines", artifacts.errorLines],
+  ];
+  const sections = sectionPairs
+    .filter(([, values]) => values.length > 0)
+    .map(([label, values]) => `- ${label}: ${values.join(" | ")}`);
+
+  if (sections.length === 0) {
+    return [
+      "Structured detail policy:",
+      "- Preserve exact commands, file paths, hashes, URLs, config values, and error strings when they matter.",
+      "- Never paraphrase technical identifiers that future turns may need verbatim.",
+    ].join("\n");
+  }
+
+  return [
+    "Structured detail policy:",
+    "- Preserve exact commands, file paths, hashes, URLs, config values, and error strings when they matter.",
+    "- Never paraphrase technical identifiers that future turns may need verbatim.",
+    "- If you compress prose, keep the identifiers below verbatim when still relevant:",
+    ...sections,
+  ].join("\n");
+}
+
+function summaryContainsItem(summary: string, item: string): boolean {
+  const normalizedSummary = summary.toLowerCase();
+  return normalizedSummary.includes(item.toLowerCase());
+}
+
+function appendStructuredArtifacts(summary: string, text: string): string {
+  const trimmedSummary = summary.trim();
+  if (!trimmedSummary) {
+    return trimmedSummary;
+  }
+
+  const artifacts = extractStructuredArtifacts(text);
+  const missingSections = [
+    ["Commands", artifacts.commands.filter((item) => !summaryContainsItem(trimmedSummary, item))],
+    ["Paths", artifacts.paths.filter((item) => !summaryContainsItem(trimmedSummary, item))],
+    ["URLs", artifacts.urls.filter((item) => !summaryContainsItem(trimmedSummary, item))],
+    ["Hashes", artifacts.hashes.filter((item) => !summaryContainsItem(trimmedSummary, item))],
+    [
+      "Config values",
+      artifacts.configValues.filter((item) => !summaryContainsItem(trimmedSummary, item)),
+    ],
+    [
+      "Error strings",
+      artifacts.errorLines.filter((item) => !summaryContainsItem(trimmedSummary, item)),
+    ],
+  ].filter(([, values]) => values.length > 0);
+
+  if (missingSections.length === 0) {
+    return trimmedSummary;
+  }
+
+  const appendix = missingSections.map(
+    ([label, values]) => `${label}: ${(values as string[]).slice(0, STRUCTURED_ITEM_LIMIT).join(" | ")}`,
+  );
+  return `${trimmedSummary}\n\nKey technical identifiers:\n${appendix.join("\n")}`;
 }
 
 /** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
@@ -456,6 +603,7 @@ function buildLeafSummaryPrompt(params: {
     "You summarize a SEGMENT of an OpenClaw conversation for future model turns.",
     "Treat this as incremental memory compaction input, not a full-conversation summary.",
     policy,
+    buildStructuredArtifactInstruction(text),
     instructionBlock,
     [
       "Output requirements:",
@@ -495,6 +643,7 @@ function buildD1Prompt(params: {
   return [
     "You are compacting leaf-level conversation summaries into a single condensed memory node.",
     "You are preparing context for a fresh model instance that will continue this conversation.",
+    buildStructuredArtifactInstruction(text),
     instructionBlock,
     previousContextBlock,
     [
@@ -535,6 +684,7 @@ function buildD2Prompt(params: {
   return [
     "You are condensing multiple session-level summaries into a higher-level memory node.",
     "A future model should understand trajectory, not per-session minutiae.",
+    buildStructuredArtifactInstruction(text),
     instructionBlock,
     [
       "Preserve:",
@@ -571,6 +721,7 @@ function buildD3PlusPrompt(params: {
   return [
     "You are creating a high-level memory node from multiple phase-level summaries.",
     "This may persist for the rest of the conversation. Keep only durable context.",
+    buildStructuredArtifactInstruction(text),
     instructionBlock,
     [
       "Preserve:",
@@ -833,7 +984,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       console.error(
         `[engram] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
       );
-      return buildDeterministicFallbackSummary(text, targetTokens);
+      return appendStructuredArtifacts(buildDeterministicFallbackSummary(text, targetTokens), text);
     }
 
     if (summarySource !== "content") {
@@ -842,6 +993,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       );
     }
 
-    return summary;
+    return appendStructuredArtifacts(summary, text);
   };
 }

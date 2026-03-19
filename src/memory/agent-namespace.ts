@@ -26,3 +26,21 @@ export function resolveMemoryNamespaceFromSessionContext(input: {
 
   return normalizeMemoryNamespace(input.deps.normalizeAgentId(parsed.agentId));
 }
+
+export function resolveSourceAgentIdFromSessionContext(input: {
+  deps?: Pick<LcmDependencies, "parseAgentSessionKey" | "normalizeAgentId">;
+  sessionKey?: string;
+}): string {
+  const sessionKey = input.sessionKey?.trim();
+  if (!sessionKey || !input.deps) {
+    return DEFAULT_MEMORY_NAMESPACE;
+  }
+
+  const parsed = input.deps.parseAgentSessionKey(sessionKey);
+  if (!parsed?.agentId) {
+    return DEFAULT_MEMORY_NAMESPACE;
+  }
+
+  const normalized = input.deps.normalizeAgentId(parsed.agentId)?.trim();
+  return normalized || DEFAULT_MEMORY_NAMESPACE;
+}

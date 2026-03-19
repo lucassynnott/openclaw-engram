@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "../db/features.js";
 import type { LcmConfig } from "../db/config.js";
-import { findEntityMatches, getEntityDetail } from "../entity/world-model.js";
+import { ensureWorldModelReady, findEntityMatches, getEntityDetail } from "../entity/world-model.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { sanitizeFts5Query } from "../memory/store/fts5-sanitize.js";
 import {
@@ -24,12 +24,14 @@ export type MemoryRecallCandidate = {
   content: string;
   scope: string;
   confidence: number;
+  effectiveConfidence: number;
   valueScore: number;
   tags: string[];
   createdAt: string;
   updatedAt: string;
   contentTime: string | null;
   validUntil: string | null;
+  sourceAgent: string | null;
   status: string;
   archivedAt: string | null;
   entityLockMatched: boolean;
@@ -45,6 +47,9 @@ export type MemoryRecallCandidate = {
   vectorSimilarity: number;
   estimatedTokens: number;
 };
+
+const CONFIDENCE_HALF_LIFE_DAYS = 14;
+const CONFIDENCE_DECAY_FLOOR = 0.45;
 
 type FetchMemoryCandidatesOptions = {
   config?: LcmConfig;
@@ -101,9 +106,17 @@ function resolveEntityLockTerms(
   query: string,
   entityId: string | undefined,
   enabled: boolean,
+  config?: LcmConfig,
 ): string[] {
   if (!enabled) {
     return [];
+  }
+  if (config) {
+    try {
+      ensureWorldModelReady({ db, config });
+    } catch {
+      // World-model refresh is best-effort during recall.
+    }
   }
   if (entityId) {
     const detail = getEntityDetail(db, entityId);
@@ -179,7 +192,7 @@ function queryRows(
   const { where, params } = buildQualifiedWhereClause({ ...options, includeArchived }, "m");
   const selected = `
     SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at, m.updated_at,
-           m.content_time, m.valid_until, m.status, m.archived_at
+           m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent
     FROM memory_current m
   `;
 
@@ -224,7 +237,7 @@ function loadRowsByMemoryIds(
   const rows = db
     .prepare(
       `SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at
+              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent
        FROM memory_current m
        WHERE m.memory_id IN (${placeholders})`,
     )
@@ -267,7 +280,7 @@ async function queryVectorRows(
   const rows = db
     .prepare(
       `SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at,
+              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent,
               v.embedding_json, v.dense_embedding_json, v.source_updated_at AS vector_source_updated_at,
               v.algorithm AS vector_algorithm, v.dimensions AS vector_dimensions,
               v.embedding_signature
@@ -367,7 +380,7 @@ async function queryVectorRows(
            WHERE embedding MATCH ? AND k = ?
          )
          SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-                m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at,
+                m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent,
                 knn.distance AS vector_distance
          FROM knn
          JOIN memory_vector_rowids r ON r.vector_rowid = knn.rowid
@@ -437,6 +450,38 @@ async function queryVectorRows(
   };
 }
 
+function resolveEffectiveConfidence(row: Record<string, unknown>): number {
+  const rawConfidence = Math.max(0, Math.min(1, Number(row.confidence || 0)));
+  if (rawConfidence <= 0) {
+    return 0;
+  }
+
+  const nowMs = Date.now();
+  const validUntil = typeof row.valid_until === "string" ? Date.parse(row.valid_until) : NaN;
+  if (Number.isFinite(validUntil) && validUntil < nowMs) {
+    return Number((rawConfidence * 0.35).toFixed(4));
+  }
+
+  const freshnessAnchor = [
+    row.last_reviewed_at,
+    row.updated_at,
+    row.content_time,
+    row.created_at,
+  ]
+    .map((value) => (typeof value === "string" ? Date.parse(value) : NaN))
+    .find((value) => Number.isFinite(value));
+  if (!Number.isFinite(freshnessAnchor)) {
+    return rawConfidence;
+  }
+
+  const ageDays = Math.max(0, (nowMs - Number(freshnessAnchor)) / (24 * 60 * 60 * 1000));
+  const decayFactor = Math.max(
+    CONFIDENCE_DECAY_FLOOR,
+    Math.pow(0.5, ageDays / CONFIDENCE_HALF_LIFE_DAYS),
+  );
+  return Number((rawConfidence * decayFactor).toFixed(4));
+}
+
 function scoreCandidate(
   row: Record<string, unknown>,
   query: string,
@@ -448,6 +493,7 @@ function scoreCandidate(
   const tags = parseJsonArray(row.tags);
   const combined = `${content}\n${tags.join(" ")}`.toLowerCase();
   const confidence = Math.max(0, Math.min(1, Number(row.confidence || 0)));
+  const effectiveConfidence = resolveEffectiveConfidence(row);
   const valueScore = Math.max(0, Math.min(1, Number(row.value_score || 0)));
   const queryLower = query.toLowerCase();
   const vector = Math.max(0, vectorSimilarity) * 0.28;
@@ -467,7 +513,7 @@ function scoreCandidate(
 
   const temporal = row.content_time ? 0.05 : 0;
   const scoreBreakdown = {
-    confidence: confidence * 0.5,
+    confidence: effectiveConfidence * 0.5,
     value: valueScore * 0.18,
     lexical: lexical,
     vector,
@@ -487,12 +533,14 @@ function scoreCandidate(
     content,
     scope: String(row.scope || "shared"),
     confidence,
+    effectiveConfidence,
     valueScore,
     tags,
     createdAt: String(row.created_at || ""),
     updatedAt: String(row.updated_at || row.created_at || ""),
     contentTime: typeof row.content_time === "string" ? row.content_time : null,
     validUntil: typeof row.valid_until === "string" ? row.valid_until : null,
+    sourceAgent: typeof row.source_agent === "string" ? row.source_agent : null,
     status: String(row.status || "active"),
     archivedAt: typeof row.archived_at === "string" ? row.archived_at : null,
     entityLockMatched,
@@ -521,6 +569,7 @@ export async function fetchMemoryCandidates(
     options.query,
     options.entityId,
     options.entityLockEnabled !== false,
+    options.config,
   );
 
   const primaryRows = queryRows(db, options.query, options, Boolean(options.includeArchived));

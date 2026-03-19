@@ -37,6 +37,8 @@ import {
   getSynthesis,
   findEntityMatches,
   getEntityDetail,
+  listEntityLinks,
+  mergeEntities,
 } from "../src/entity/world-model.js";
 
 const tempDirs: string[] = [];
@@ -56,6 +58,28 @@ function cleanup() {
     } catch {}
   }
   tempDirs.length = 0;
+}
+
+function ensureMemoryCurrentForWorldModel(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_current (
+      memory_id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      type TEXT NOT NULL DEFAULT 'USER_FACT',
+      confidence REAL NOT NULL DEFAULT 0.75,
+      scope TEXT NOT NULL DEFAULT 'shared',
+      source_layer TEXT NOT NULL DEFAULT 'registry',
+      source_path TEXT,
+      source_line INTEGER,
+      content_time TEXT,
+      valid_until TEXT,
+      superseded_by TEXT,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      tags TEXT NOT NULL DEFAULT '[]'
+    )
+  `);
 }
 
 afterEach(() => {
@@ -206,6 +230,8 @@ describe("World Model Store", () => {
       expect(tableNames).toContain("entity_episodes");
       expect(tableNames).toContain("entity_open_loops");
       expect(tableNames).toContain("entity_syntheses");
+      expect(tableNames).toContain("entity_links");
+      expect(tableNames).toContain("entity_merge_overrides");
     });
 
     it("is idempotent", () => {
@@ -235,6 +261,22 @@ describe("World Model Store", () => {
       expect(result1).toHaveProperty("counts");
       expect(result1.counts).toHaveProperty("entities");
     });
+
+    it("rebuilds from memory_current activity, not just summaries", () => {
+      const db = createTestDb();
+      ensureMemoryCurrentForWorldModel(db);
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO memory_current (
+          memory_id, content, status, type, confidence, scope, source_layer, updated_at, created_at, tags
+        ) VALUES (?, ?, 'active', 'USER_FACT', 0.88, 'shared', 'registry', ?, ?, ?)
+      `).run("mem_sarah", "Sarah prefers tea and works on Engram", now, now, JSON.stringify(["Sarah"]));
+
+      const result = ensureWorldModelReady({ db });
+
+      expect(result.rebuilt).toBe(true);
+      expect(listEntities(db, { includeHidden: true }).some((entity) => entity.display_name === "Sarah")).toBe(true);
+    });
   });
 
   describe("rebuildWorldModel", () => {
@@ -247,6 +289,57 @@ describe("World Model Store", () => {
       expect(result.counts).toHaveProperty("beliefs");
       expect(result).toHaveProperty("ok");
       expect(result).toHaveProperty("rebuilt");
+    });
+
+    it("creates durable entity links from source memories", () => {
+      const db = createTestDb();
+      ensureMemoryCurrentForWorldModel(db);
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO memory_current (
+          memory_id, content, status, type, confidence, scope, source_layer, updated_at, created_at, tags
+        ) VALUES (?, ?, 'active', 'USER_FACT', 0.91, 'shared', 'registry', ?, ?, ?)
+      `).run("mem_lucas", "Lucas prefers precise rollout checklists", now, now, JSON.stringify(["Lucas"]));
+
+      rebuildWorldModel({ db });
+      const entity = listEntities(db, { includeHidden: true }).find((row) => row.display_name === "Lucas");
+      expect(entity).toBeTruthy();
+      const links = listEntityLinks(db, { entityId: String(entity?.entity_id || "") });
+      expect(links.length).toBeGreaterThan(0);
+      expect(links[0].record_id).toBe("mem_lucas");
+    });
+
+    it("applies merge overrides across rebuilds", () => {
+      const db = createTestDb();
+      ensureMemoryCurrentForWorldModel(db);
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO memory_current (
+          memory_id, content, status, type, confidence, scope, source_layer, updated_at, created_at, tags
+        ) VALUES (?, ?, 'active', 'USER_FACT', 0.84, 'shared', 'registry', ?, ?, ?)
+      `).run("mem_lucas", "Lucas is coordinating Engram rollout", now, now, JSON.stringify(["Lucas"]));
+      db.prepare(`
+        INSERT INTO memory_current (
+          memory_id, content, status, type, confidence, scope, source_layer, updated_at, created_at, tags
+        ) VALUES (?, ?, 'active', 'USER_FACT', 0.84, 'shared', 'registry', ?, ?, ?)
+      `).run("mem_lukas", "Lukas is coordinating Engram rollout", now, now, JSON.stringify(["Lukas"]));
+
+      rebuildWorldModel({ db });
+      const before = listEntities(db, { includeHidden: true });
+      expect(before.some((entity) => entity.display_name === "Lucas")).toBe(true);
+      expect(before.some((entity) => entity.display_name === "Lukas")).toBe(true);
+
+      const merged = mergeEntities({
+        db,
+        winnerEntityId: "person:lucas",
+        loserEntityId: "person:lukas",
+      });
+      expect(merged.ok).toBe(true);
+
+      rebuildWorldModel({ db });
+      const after = listEntities(db, { includeHidden: true });
+      expect(after.some((entity) => entity.entity_id === "person:lucas")).toBe(true);
+      expect(after.some((entity) => entity.entity_id === "person:lukas")).toBe(false);
     });
   });
 });
@@ -345,6 +438,7 @@ describe("Entity Operations", () => {
       expect(entity).not.toBeNull();
       expect(entity?.display_name).toBe("Alice Smith");
       expect(entity?.kind).toBe("person");
+      expect(Array.isArray(entity?.links)).toBe(true);
     });
   });
 });

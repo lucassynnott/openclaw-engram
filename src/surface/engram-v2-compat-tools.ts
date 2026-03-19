@@ -1,10 +1,17 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
-import { findEntityMatches, getEntityDetail } from "../entity/world-model.js";
+import {
+  ensureWorldModelReady,
+  findEntityMatches,
+  getEntityDetail,
+  listEntityMergeSuggestions,
+  mergeEntities,
+} from "../entity/world-model.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -45,6 +52,34 @@ const EntityGetSchema = Type.Object({
   includeMemories: Type.Optional(
     Type.Boolean({
       description: "Include related raw memory snippets. Defaults to true for basic fallback entities.",
+    }),
+  ),
+});
+
+const EntityMergeSchema = Type.Object({
+  winnerEntityId: Type.Optional(
+    Type.String({
+      description: "Canonical entity ID to keep.",
+    }),
+  ),
+  loserEntityId: Type.Optional(
+    Type.String({
+      description: "Duplicate entity ID to merge into the winner.",
+    }),
+  ),
+  winnerName: Type.Optional(
+    Type.String({
+      description: "Fuzzy entity name to resolve as the canonical winner when IDs are not provided.",
+    }),
+  ),
+  loserName: Type.Optional(
+    Type.String({
+      description: "Fuzzy entity name to resolve as the duplicate loser when IDs are not provided.",
+    }),
+  ),
+  reason: Type.Optional(
+    Type.String({
+      description: "Optional human-readable merge reason.",
     }),
   ),
 });
@@ -108,6 +143,53 @@ function parseJsonSafe<T>(value: unknown, fallback: T): T {
   }
 }
 
+function detectLegacyOverlap(): {
+  memorySlot: string | null;
+  contextSlot: string | null;
+  warnings: string[];
+} {
+  const openclawConfigPath = path.join(homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(openclawConfigPath)) {
+    return {
+      memorySlot: null,
+      contextSlot: null,
+      warnings: [],
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(openclawConfigPath, "utf8")) as Record<string, unknown>;
+    const slots =
+      parsed.plugins && typeof parsed.plugins === "object"
+        ? ((parsed.plugins as Record<string, unknown>).slots as Record<string, unknown> | undefined)
+        : undefined;
+    const memorySlot = typeof slots?.memory === "string" ? slots.memory : null;
+    const contextSlot = typeof slots?.contextEngine === "string" ? slots.contextEngine : null;
+    const warnings: string[] = [];
+    if (memorySlot && memorySlot !== "engram") {
+      warnings.push(`memory slot points to ${memorySlot}`);
+    }
+    if (contextSlot && contextSlot !== "engram") {
+      warnings.push(`context engine slot points to ${contextSlot}`);
+    }
+    return {
+      memorySlot,
+      contextSlot,
+      warnings,
+    };
+  } catch (error) {
+    return {
+      memorySlot: null,
+      contextSlot: null,
+      warnings: [
+        `could not parse ~/.openclaw/openclaw.json: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ],
+    };
+  }
+}
+
 function hasTable(db: DatabaseSync, tableName: string): boolean {
   const row = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -131,7 +213,28 @@ function ensureCompatMemoryTables(db: DatabaseSync): void {
 function openMemoryDb(config: LcmConfig): DatabaseSync {
   const db = getLcmConnection(config.databasePath);
   ensureCompatMemoryTables(db);
+  try {
+    ensureWorldModelReady({ db, config });
+  } catch {
+    // World-model refresh is best-effort for compat surfaces.
+  }
   return db;
+}
+
+function resolveEntityIdByName(
+  db: DatabaseSync,
+  name: string,
+  role: "winner" | "loser",
+): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error(`${role}Name is required when ${role}EntityId is not provided.`);
+  }
+  const matches = findEntityMatches(db, trimmed, { limit: 2 });
+  if (matches.length === 0) {
+    throw new Error(`No ${role} entity match found for: ${trimmed}`);
+  }
+  return String(matches[0]?.entity_id || "").trim();
 }
 
 function relatedMemoriesByEntityName(
@@ -188,7 +291,7 @@ function loadMemoryById(db: DatabaseSync, id: string): Record<string, unknown> |
     .prepare(
       `SELECT memory_id, type, content, confidence, scope, status, source, source_agent, source_session,
               value_score, value_label, created_at, updated_at, archived_at, last_reviewed_at, tags,
-              content_time, valid_until
+              content_time, valid_until, superseded_by
        FROM memory_current WHERE memory_id = ? LIMIT 1`,
     )
     .get(id) as Record<string, unknown> | undefined;
@@ -206,6 +309,7 @@ function loadMemoryById(db: DatabaseSync, id: string): Record<string, unknown> |
       status: row.status,
       source: row.source,
       source_agent: row.source_agent,
+      stored_by: row.source_agent,
       source_session: row.source_session,
       value_score: row.value_score,
       value_label: row.value_label,
@@ -215,6 +319,7 @@ function loadMemoryById(db: DatabaseSync, id: string): Record<string, unknown> |
       last_reviewed_at: row.last_reviewed_at,
       content_time: row.content_time,
       valid_until: row.valid_until,
+      superseded_by: row.superseded_by,
       tags: parseJsonSafe<string[]>(row.tags, []),
     },
   };
@@ -268,6 +373,7 @@ function loadEntityById(db: DatabaseSync, id: string): Record<string, unknown> |
       episodes: detail.episodes,
       open_loops: detail.open_loops,
       syntheses: detail.syntheses,
+      links: detail.links,
     };
   }
 
@@ -617,6 +723,57 @@ export function createEntityGetTool(input: { config: LcmConfig }): AnyAgentTool 
   };
 }
 
+export function createEntityMergeTool(input: { config: LcmConfig }): AnyAgentTool {
+  return {
+    name: "entity_merge",
+    label: "Entity Merge",
+    description:
+      "Merge a duplicate entity into a canonical entity. The merge persists as a durable override and survives world-model rebuilds.",
+    parameters: EntityMergeSchema,
+    async execute(_toolCallId, params) {
+      const p = params as Record<string, unknown>;
+      let db: DatabaseSync;
+      try {
+        db = openMemoryDb(input.config);
+      } catch (err) {
+        return jsonResult({
+          error: "Memory store unavailable.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      try {
+        const winnerEntityId = String(p.winnerEntityId || "").trim()
+          || resolveEntityIdByName(db, String(p.winnerName || ""), "winner");
+        const loserEntityId = String(p.loserEntityId || "").trim()
+          || resolveEntityIdByName(db, String(p.loserName || ""), "loser");
+        if (!winnerEntityId || !loserEntityId) {
+          return jsonResult({
+            error: "Provide winnerEntityId/loserEntityId or winnerName/loserName.",
+          });
+        }
+
+        const merged = mergeEntities({
+          db,
+          winnerEntityId,
+          loserEntityId,
+          reason: String(p.reason || "").trim(),
+          config: input.config,
+        });
+        const entity = getEntityDetail(db, String(merged.winnerEntityId || ""));
+        return jsonResult({
+          ...merged,
+          entity,
+        });
+      } catch (err) {
+        return jsonResult({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+  };
+}
+
 export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool {
   return {
     name: "ops_status",
@@ -647,9 +804,21 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
           return {
             enabled: input.config.vaultEnabled,
             vault_root: input.config.vaultPath,
+            subdir: input.config.vaultSubdir,
             mirror_root: "",
             session: { last_session_at: null, stale: true },
-            vault: { last_built_at: null, stale: true },
+            vault: {
+              last_built_at: null,
+              stale: true,
+              run_id: null,
+              items_synced: 0,
+              skipped_unchanged: 0,
+              removed_files: 0,
+              generated_files: 0,
+              failures: [
+                `vault health unavailable: ${err instanceof Error ? err.message : String(err)}`,
+              ],
+            },
             manual_protection: {
               ok: false,
               issues: [
@@ -662,6 +831,7 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
       })();
       const issues: string[] = [];
       const warnings: string[] = [];
+      const overlap = detectLegacyOverlap();
       if (vault.enabled && vault.vault.stale) {
         issues.push("vault mirror is stale");
       }
@@ -678,6 +848,7 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
       } else if (!input.config.gradientEnabled) {
         warnings.push("gradient alignment engine is disabled");
       }
+      warnings.push(...overlap.warnings);
       const vectorRuntime = getVectorRuntime(input.config.databasePath);
       const vectorRuntimeStats =
         typeof vectorRuntime?.getStats === "function"
@@ -685,6 +856,13 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
               error: error instanceof Error ? error.message : String(error),
             }))
           : undefined;
+      const entityMergeSuggestions = (() => {
+        try {
+          return listEntityMergeSuggestions(db, { limit: 5 });
+        } catch {
+          return [];
+        }
+      })();
 
       return jsonResult({
         status: issues.length === 0 ? "healthy" : "degraded",
@@ -692,6 +870,10 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
         rollout: {
           ready: issues.length === 0,
           warnings,
+          plugin_slots: {
+            memory: overlap.memorySlot,
+            context_engine: overlap.contextSlot,
+          },
           optional_features: {
             vault_enabled: input.config.vaultEnabled,
             falkordb_enabled: input.config.falkorDbEnabled,
@@ -701,9 +883,11 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
         },
         memory: {
           active_memories: scalarCount(db, "memory_current", "status = 'active'"),
+          superseded_memories: scalarCount(db, "memory_current", "status = 'superseded'"),
           entities: scalarCount(db, "memory_entities"),
           episodes: scalarCount(db, "memory_episodes"),
           events: scalarCount(db, "memory_events"),
+          triggers: scalarCount(db, "memory_triggers", "enabled = 1"),
           vector_rows: scalarCount(db, "memory_vectors"),
           vector_backend: input.config.vectorBackend,
           vector_runtime: vectorRuntimeStats,
@@ -719,13 +903,31 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
           episodes: scalarCount(db, "entity_episodes"),
           open_loops: scalarCount(db, "entity_open_loops"),
           syntheses: scalarCount(db, "entity_syntheses"),
+          links: scalarCount(db, "entity_links"),
+          merge_overrides: scalarCount(db, "entity_merge_overrides"),
+          merge_suggestions: {
+            count: entityMergeSuggestions.length,
+            suggestions: entityMergeSuggestions,
+          },
         },
         vault,
+        lastVaultSync: vault?.vault?.last_built_at || null,
         alignment: alignmentStatus.details,
         issues,
         warnings,
       });
     },
+  };
+}
+
+export function createEngramStatusTool(input: { config: LcmConfig }): AnyAgentTool {
+  const base = createOpsStatusTool(input);
+  return {
+    ...base,
+    name: "engram_status",
+    label: "Engram Status",
+    description:
+      "Alias of ops_status. Returns Engram health, vault freshness, sync counters, and rollout warnings.",
   };
 }
 

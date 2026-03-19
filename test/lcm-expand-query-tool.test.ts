@@ -739,4 +739,127 @@ describe("createLcmExpandQueryTool", () => {
       success: 0,
     });
   });
+
+  it("supports batched expansion queries in parallel", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_x",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "x",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 1,
+    });
+
+    const delegatedReplies = new Map<string, string>();
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        const sessionKey = String(request.params?.sessionKey ?? "");
+        const message = String(request.params?.message ?? "");
+        if (message.includes("What caused the outage?")) {
+          delegatedReplies.set(
+            sessionKey,
+            JSON.stringify({
+              answer: "The outage came from stale token handling.",
+              citedIds: ["sum_a"],
+              expandedSummaryCount: 1,
+              totalSourceTokens: 90,
+              truncated: false,
+            }),
+          );
+        } else {
+          delegatedReplies.set(
+            sessionKey,
+            JSON.stringify({
+              answer: "The regression followed deploy B.",
+              citedIds: ["sum_x"],
+              expandedSummaryCount: 1,
+              totalSourceTokens: 120,
+              truncated: false,
+            }),
+          );
+        }
+        return { runId: `run-${delegatedReplies.size}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        const sessionKey = String(request.params?.key ?? "");
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: delegatedReplies.get(sessionKey) || "",
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, conversationId: 7 }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-batch", {
+      queries: [
+        {
+          summaryIds: ["sum_a"],
+          prompt: "What caused the outage?",
+          conversationId: 42,
+        },
+        {
+          query: "deploy regression",
+          prompt: "What regressed?",
+          conversationId: 7,
+        },
+      ],
+    });
+
+    expect(result.details).toMatchObject({
+      batched: true,
+      totalQueries: 2,
+      completedQueries: 2,
+      failedQueries: 0,
+    });
+    expect((result.details as { results: Array<Record<string, unknown>> }).results).toEqual([
+      expect.objectContaining({
+        index: 0,
+        ok: true,
+        result: expect.objectContaining({
+          answer: "The outage came from stale token handling.",
+          sourceConversationId: 42,
+        }),
+      }),
+      expect.objectContaining({
+        index: 1,
+        ok: true,
+        result: expect.objectContaining({
+          answer: "The regression followed deploy B.",
+          sourceConversationId: 7,
+        }),
+      }),
+    ]);
+    expect(
+      callGatewayMock.mock.calls.filter(
+        ([opts]) => (opts as { method?: string }).method === "agent",
+      ),
+    ).toHaveLength(2);
+  });
 });
