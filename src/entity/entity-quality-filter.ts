@@ -680,6 +680,10 @@ const COMMON_ENGLISH_WORDS = new Set([
   "andromeda", "lightpanda", "gigabrain", "inovativ", "brandloom",
   "hillsong", "claw", "claws", "bizzuka",
 
+  // -- AI product / tool names that are NOT person names --
+  "claude", "gemini", "copilot", "chatgpt", "midjourney", "perplexity",
+  "anthropic", "mistral", "llama", "cursor",
+
   // -- Additional common words / tech-product names that are NOT person names --
   // These are either dictionary words or well-known product/brand names that
   // should not be classified as "person" entities. They may still be valid
@@ -772,6 +776,29 @@ const COMMON_ENGLISH_WORDS = new Set([
   "welcome", "what", "whether", "why", "wire", "work", "workbook",
   "workflows", "workgraph", "works", "write", "writer",
   "yeah", "you", "zero", "zone",
+
+  // -- Additional common / technical words that still appeared as garbage entities --
+  "alongside", "amber", "analyze", "anyway", "application", "archetype",
+  "assets", "atoms",
+  "bash", "bounded", "building",
+  "calls", "checkout", "committed", "credential",
+  "dockerfile", "dockerfiles", "drive",
+  "entrypoint",
+  "failing",
+  "harden", "highspeed",
+  "indexed", "installed", "instead",
+  "lightning", "literal", "lovable",
+  "manager", "marketing", "max", "messaging", "moved",
+  "newsletter",
+  "orchestrator",
+  "passing", "people", "playbooks", "productization", "products",
+  "provisioning",
+  "quiz",
+  "reference", "remediation", "required", "routes",
+  "scoring", "seminar", "setter", "signs", "stealth",
+  "thinking", "tightening", "triage",
+  "uncommitted",
+  "weekend", "woke",
 ]);
 
 // ---------------------------------------------------------------------------

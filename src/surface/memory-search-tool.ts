@@ -197,6 +197,7 @@ export function createMemorySearchTool(input: { config: LcmConfig }): AnyAgentTo
             vector: Number(memory.scoreBreakdown.vector.toFixed(4)),
             temporal: Number(memory.scoreBreakdown.temporal.toFixed(4)),
             entity: Number(memory.scoreBreakdown.entity.toFixed(4)),
+            typeMultiplier: Number(memory.scoreBreakdown.typeMultiplier.toFixed(4)),
           },
         })),
       });

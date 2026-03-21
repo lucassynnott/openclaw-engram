@@ -43,6 +43,7 @@ export type MemoryRecallCandidate = {
     vector: number;
     temporal: number;
     entity: number;
+    typeMultiplier: number;
   };
   vectorSimilarity: number;
   estimatedTokens: number;
@@ -50,6 +51,32 @@ export type MemoryRecallCandidate = {
 
 const CONFIDENCE_HALF_LIFE_DAYS = 14;
 const CONFIDENCE_DECAY_FLOOR = 0.45;
+
+// ── Type-based score multipliers ─────────────────────────────────────────────
+// Applied as a post-hoc multiplier on the composite score to bias ranking
+// toward high-signal memory types and away from verbose low-signal ones.
+const TYPE_SCORE_MULTIPLIERS: Record<string, number> = {
+  PREFERENCE: 1.3,
+  DECISION: 1.2,
+  USER_FACT: 1.0,
+  AGENT_IDENTITY: 1.0,
+  ENTITY: 0.9,
+  CONTEXT: 0.8,
+  EPISODE: 0.6,
+};
+const DEFAULT_TYPE_MULTIPLIER = 1.0;
+
+// Extra penalty multiplier applied on top of the type multiplier when the
+// content matches heartbeat / status-dump patterns.
+const HEARTBEAT_PENALTY_MULTIPLIER = 0.5;
+const HEARTBEAT_PATTERNS = [
+  /\bheartbeat\b/i,
+  /\bHEARTBEAT_OK\b/,
+  /\bhealth remains clean\b/i,
+  /\bheartbeat status\b/i,
+  /\bsystem health check\b/i,
+  /\bstatus dump\b/i,
+];
 
 type FetchMemoryCandidatesOptions = {
   config?: LcmConfig;
@@ -512,6 +539,27 @@ function scoreCandidate(
   }
 
   const temporal = row.content_time ? 0.05 : 0;
+
+  const rawScore =
+    effectiveConfidence * 0.5
+    + valueScore * 0.18
+    + lexical
+    + vector
+    + temporal
+    + entity;
+
+  // Apply type-based multiplier to bias ranking by memory type.
+  const memoryType = String(row.type || "CONTEXT").toUpperCase();
+  let typeMultiplier = TYPE_SCORE_MULTIPLIERS[memoryType] ?? DEFAULT_TYPE_MULTIPLIER;
+
+  // Additional heartbeat penalty: verbose status dumps match broadly on
+  // vector similarity but are rarely useful for factual recall.
+  if (HEARTBEAT_PATTERNS.some((pattern) => pattern.test(content))) {
+    typeMultiplier *= HEARTBEAT_PENALTY_MULTIPLIER;
+  }
+
+  const score = rawScore * typeMultiplier;
+
   const scoreBreakdown = {
     confidence: effectiveConfidence * 0.5,
     value: valueScore * 0.18,
@@ -519,13 +567,8 @@ function scoreCandidate(
     vector,
     temporal,
     entity,
+    typeMultiplier,
   };
-  const score = scoreBreakdown.confidence
-    + scoreBreakdown.value
-    + scoreBreakdown.lexical
-    + scoreBreakdown.vector
-    + scoreBreakdown.temporal
-    + scoreBreakdown.entity;
 
   return {
     id: String(row.memory_id || ""),

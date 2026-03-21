@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
+import { isLikelyEntityName } from "../entity/entity-quality-filter.js";
 import { ensureWorldModelReady, findEntityMatches } from "../entity/world-model.js";
 import { resolveSourceAgentIdFromSessionContext } from "../memory/agent-namespace.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
@@ -460,6 +461,8 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
   if (resolvedEntities.length > 0) {
     for (const entityName of resolvedEntities) {
       const normalizedName = entityName.toLowerCase().trim();
+      // Filter out common English words that are not real entity names
+      if (!isLikelyEntityName(normalizedName)) continue;
       const existing = db
         .prepare("SELECT entity_id FROM memory_entities WHERE normalized_name = ? LIMIT 1")
         .get(normalizedName) as { entity_id: string } | undefined;

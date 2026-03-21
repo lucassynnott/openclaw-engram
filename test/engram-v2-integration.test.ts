@@ -93,10 +93,10 @@ describe("Engram v2 Core Tools Integration Test", () => {
 
     it("creates entity records and episode for temporal content", async () => {
       const tool = createMemoryAddTool({ config });
-      
+
       const result = await tool.execute("t2", {
-        content: "Today Lucas implemented the memory integration test suite for Engram v2",
-        entities: ["Lucas", "Engram"],
+        content: "Today Lucas and Viktor implemented the memory integration test suite",
+        entities: ["Lucas", "Viktor"],
       });
 
       expect(result.details.stored).toBe(true);
@@ -109,19 +109,19 @@ describe("Engram v2 Core Tools Integration Test", () => {
       const episode = db
         .prepare("SELECT * FROM memory_episodes WHERE episode_id = ?")
         .get(result.details.episodeId) as Record<string, unknown> | undefined;
-      
+
       expect(episode).toBeDefined();
       expect(episode?.status).toBe("completed");
-      expect(episode?.title).toContain("Today Lucas implemented");
+      expect(episode?.title).toContain("Today Lucas and Viktor");
 
-      // Verify entities
+      // Verify entities — common words like "engram" are filtered out
       const entities = db
         .prepare("SELECT * FROM memory_entities ORDER BY normalized_name")
         .all() as Array<Record<string, unknown>>;
-      
+
       expect(entities.length).toBe(2);
       expect(entities.some((e) => e.normalized_name === "lucas")).toBe(true);
-      expect(entities.some((e) => e.normalized_name === "engram")).toBe(true);
+      expect(entities.some((e) => e.normalized_name === "viktor")).toBe(true);
     });
 
     it("writes audit events to memory_events table", async () => {

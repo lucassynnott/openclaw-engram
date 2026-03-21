@@ -227,7 +227,7 @@ const FLINT_RESPONSE_RE = /\b(?:flint(?:'s|'s)? name is mentioned|flint response
 const CURRENT_STATE_ALLOWED_TOPICS = new Set(["relationship", "location", "role", "preference", "project", "health"]);
 const STABLE_IDENTITY_SUBTOPICS = new Set(["preferred_name", "communication_style", "visual_identity"]);
 const DURABLE_PROJECT_SUBTOPICS = new Set(["investment_relation", "interview_status", "response_behavior", "food_image_comparison"]);
-const ENTITY_EXTRACTION_SCHEMA_VERSION = "2026-03-19-entity-quality-v2";
+const ENTITY_EXTRACTION_SCHEMA_VERSION = "2026-03-21-entity-quality-v3";
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -1286,10 +1286,10 @@ const evaluateEntityCandidate = ({ entityKey = "", kind = "", aliases = [] as st
   if (kind === "organization" && confidence < ORG_MIN_CONFIDENCE && !explicitlyTyped && !hasCuratedEvidence) return { accepted: false, kind, aliases: filteredAliases, reason: "below_org_confidence_floor" };
   if (kind === "project" && confidence < PROJECT_MIN_CONFIDENCE && !explicitlyTyped && !hasCuratedEvidence) return { accepted: false, kind, aliases: filteredAliases, reason: "below_project_confidence_floor" };
 
-  // --- Person name quality: reject single common English words as person names ---
-  // This is stricter for person entities because words like "boundaries",
-  // "features", "append" are never person names, but could be project names.
-  if (kind === "person" && !isLikelyEntityName(normalizedKey) && !explicitlyTagged) return { accepted: false, kind, aliases: filteredAliases, reason: "common_word_not_person" };
+  // --- Entity name quality: reject single common English words for ALL entity kinds ---
+  // Common words like "work", "tools", "google", "claude" should never be
+  // classified as entities of any kind (person, org, project, place, topic).
+  if (!isLikelyEntityName(normalizedKey) && !explicitlyTagged && !explicitlyTyped) return { accepted: false, kind, aliases: filteredAliases, reason: "common_word_not_entity" };
 
   if (kind === "person") {
     const enoughEvidence = explicitlyTagged && strongName ? evidenceCount >= 1 : evidenceCount >= Math.max(surfaceConfig.minEvidence, 2);
