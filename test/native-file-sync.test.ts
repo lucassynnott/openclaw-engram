@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { ensureMemoryTables } from "../src/memory/memory-schema.js";
-import { hashNormalized, normalizeContent } from "../src/memory/memory-utils.js";
+import { classifyValue, hashNormalized, normalizeContent } from "../src/memory/memory-utils.js";
 import {
   reindexNativeMemoryLayer,
   syncNativeMemoryLayer,
@@ -253,5 +253,180 @@ describe("native file sync layer", () => {
     expect(second.conflicts).toBe(0);
     expect(finalRow?.source_layer).toBe("native");
     expect(finalRow?.source_path).toBe("MEMORY.md");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memory sync filter tests — MEMORY.md sync block quality
+// ---------------------------------------------------------------------------
+
+describe("memory sync block quality filters", () => {
+  function insertTestMemory(
+    db: ReturnType<typeof getLcmConnection>,
+    params: {
+      memoryId: string;
+      type: string;
+      content: string;
+      status?: string;
+      scope?: string;
+      createdAt?: string;
+    },
+  ) {
+    const normalized = normalizeContent(params.content);
+    const hash = hashNormalized(params.content);
+    const confidence = 0.8;
+    const classification = classifyValue(params.content, params.type as any, confidence);
+    const now = params.createdAt || new Date().toISOString();
+    db.prepare(`
+      INSERT INTO memory_current (
+        memory_id, type, content, normalized, normalized_hash,
+        source, confidence, scope, status, value_score, value_label,
+        created_at, updated_at, archived_at, tags, superseded_by,
+        content_time, source_layer, source_path, source_line
+      ) VALUES (?, ?, ?, ?, ?, 'test', ?, ?, ?, ?, ?, ?, ?, NULL, '[]', NULL, NULL, 'registry', NULL, NULL)
+    `).run(
+      params.memoryId,
+      params.type,
+      params.content,
+      normalized,
+      hash,
+      confidence,
+      params.scope ?? "shared",
+      params.status ?? "active",
+      classification.value_score,
+      classification.value_label,
+      now,
+      now,
+    );
+  }
+
+  it("excludes EPISODE type from MEMORY.md sync block", () => {
+    const { db, dir } = makeDb();
+    ensureMemoryTables(db);
+
+    insertTestMemory(db, {
+      memoryId: "mem_pref_sync",
+      type: "PREFERENCE",
+      content: "Lucas prefers dark mode in all editors",
+    });
+    insertTestMemory(db, {
+      memoryId: "mem_episode_sync",
+      type: "EPISODE",
+      content: "Today Lucas reviewed pull requests and fixed three bugs",
+    });
+    insertTestMemory(db, {
+      memoryId: "mem_fact_sync",
+      type: "USER_FACT",
+      content: "Lucas works as a software engineer in Vienna",
+    });
+
+    writeFileSync(join(dir, "MEMORY.md"), "# MEMORY\n", "utf8");
+    syncNativeMemoryLayer({ db, rootDir: dir });
+
+    const memoryMd = readFileSync(join(dir, "MEMORY.md"), "utf8");
+
+    // PREFERENCE and USER_FACT should appear
+    expect(memoryMd).toContain("Lucas prefers dark mode in all editors");
+    expect(memoryMd).toContain("Lucas works as a software engineer in Vienna");
+
+    // EPISODE should NOT appear in the sync block
+    expect(memoryMd).not.toContain("Today Lucas reviewed pull requests");
+    expect(memoryMd).not.toContain("[EPISODE]");
+  });
+
+  it("excludes DECISION entries over 200 chars from sync block", () => {
+    const { db, dir } = makeDb();
+    ensureMemoryTables(db);
+
+    const shortDecision = "We decided to use Vitest for testing";
+    const longDecision = "A".repeat(201);
+
+    insertTestMemory(db, {
+      memoryId: "mem_short_decision",
+      type: "DECISION",
+      content: shortDecision,
+    });
+    insertTestMemory(db, {
+      memoryId: "mem_long_decision",
+      type: "DECISION",
+      content: longDecision,
+    });
+
+    writeFileSync(join(dir, "MEMORY.md"), "# MEMORY\n", "utf8");
+    syncNativeMemoryLayer({ db, rootDir: dir });
+
+    const memoryMd = readFileSync(join(dir, "MEMORY.md"), "utf8");
+
+    expect(memoryMd).toContain(shortDecision);
+    expect(memoryMd).not.toContain(longDecision);
+  });
+
+  it("respects 6K char cap for sync block", () => {
+    const { db, dir } = makeDb();
+    ensureMemoryTables(db);
+
+    // Insert enough memories to exceed 6K chars
+    for (let i = 0; i < 100; i++) {
+      insertTestMemory(db, {
+        memoryId: `mem_cap_${String(i).padStart(3, "0")}`,
+        type: "USER_FACT",
+        content: `Memory entry number ${i}: this is a test fact that fills up space in the sync block with enough text to matter. Some details about topic ${i}.`,
+        createdAt: new Date(Date.now() - i * 60000).toISOString(),
+      });
+    }
+
+    writeFileSync(join(dir, "MEMORY.md"), "# MEMORY\n", "utf8");
+    syncNativeMemoryLayer({ db, rootDir: dir });
+
+    const memoryMd = readFileSync(join(dir, "MEMORY.md"), "utf8");
+    const syncStart = memoryMd.indexOf("<!-- engram:sync:start -->");
+    const syncEnd = memoryMd.indexOf("<!-- engram:sync:end -->");
+
+    expect(syncStart).toBeGreaterThanOrEqual(0);
+    expect(syncEnd).toBeGreaterThan(syncStart);
+
+    const syncBlock = memoryMd.slice(syncStart, syncEnd);
+    // The sync block content (excluding the markers) should be within the 6K limit.
+    // We check the rendered content is bounded. The block includes headers and
+    // formatting, so allow a small margin above 6000 for the wrapper structure.
+    expect(syncBlock.length).toBeLessThan(7000);
+  });
+
+  it("newest memories win when cap is reached", () => {
+    const { db, dir } = makeDb();
+    ensureMemoryTables(db);
+
+    // Insert oldest memory first
+    insertTestMemory(db, {
+      memoryId: "mem_old",
+      type: "USER_FACT",
+      content: "This is an old memory that should be dropped if cap is tight",
+      createdAt: "2025-01-01T00:00:00.000Z",
+    });
+    // Insert newest memory
+    insertTestMemory(db, {
+      memoryId: "mem_new",
+      type: "USER_FACT",
+      content: "This is a new memory that should be kept if cap is tight",
+      createdAt: "2026-03-21T00:00:00.000Z",
+    });
+
+    // Insert many in between to fill cap
+    for (let i = 0; i < 80; i++) {
+      insertTestMemory(db, {
+        memoryId: `mem_filler_${String(i).padStart(3, "0")}`,
+        type: "USER_FACT",
+        content: `Filler memory number ${i} with enough content to consume characters in the sync block output here.`,
+        createdAt: new Date(Date.parse("2026-02-01T00:00:00.000Z") + i * 60000).toISOString(),
+      });
+    }
+
+    writeFileSync(join(dir, "MEMORY.md"), "# MEMORY\n", "utf8");
+    syncNativeMemoryLayer({ db, rootDir: dir });
+
+    const memoryMd = readFileSync(join(dir, "MEMORY.md"), "utf8");
+
+    // The newest memory should appear in the sync block
+    expect(memoryMd).toContain("This is a new memory that should be kept");
   });
 });

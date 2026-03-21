@@ -145,20 +145,29 @@ export function createMemorySearchTool(input: { config: LcmConfig }): AnyAgentTo
         });
       }
 
-      const result = await fetchMemoryCandidates(db, {
-        config: input.config,
-        query,
-        topK,
-        minScore,
-        maxTokens,
-        scope: typeof p.scope === "string" ? p.scope.trim() : undefined,
-        allScopes: Boolean(p.allScopes),
-        kind,
-        includeArchived: Boolean(p.includeArchived),
-        archiveFallback: input.config.recallArchiveFallback,
-        entityLockEnabled: input.config.recallEntityLockEnabled,
-        entityId: typeof p.entityId === "string" ? p.entityId.trim() : undefined,
-      });
+      let result: Awaited<ReturnType<typeof fetchMemoryCandidates>>;
+      try {
+        result = await fetchMemoryCandidates(db, {
+          config: input.config,
+          query,
+          topK,
+          minScore,
+          maxTokens,
+          scope: typeof p.scope === "string" ? p.scope.trim() : undefined,
+          allScopes: Boolean(p.allScopes),
+          kind,
+          includeArchived: Boolean(p.includeArchived),
+          archiveFallback: input.config.recallArchiveFallback,
+          entityLockEnabled: input.config.recallEntityLockEnabled,
+          entityId: typeof p.entityId === "string" ? p.entityId.trim() : undefined,
+        });
+      } catch (err) {
+        console.error("[memory_search] recall failed:", err);
+        return jsonResult({
+          error: "Memory recall failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       return jsonResult({
         query,

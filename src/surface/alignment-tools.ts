@@ -465,6 +465,7 @@ export function createAlignmentStatusTool(input: { config: LcmConfig }): AnyAgen
       "Check alignment engine health, current mode, recent evaluation counts, and drift alerts.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
+      try {
       if (!isGradientEnabled(input.config)) {
         return jsonResult(buildDisabledResult(input.config));
       }
@@ -488,6 +489,13 @@ export function createAlignmentStatusTool(input: { config: LcmConfig }): AnyAgen
         drift,
         alerts,
       });
+      } catch (err) {
+        console.error("[alignment_status] unexpected error:", err);
+        return jsonResult({
+          error: "Alignment status check failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }
@@ -509,6 +517,7 @@ export function createAlignmentCheckTool(input: { config: LcmConfig }): AnyAgent
       ),
     }),
     async execute(_toolCallId, params) {
+      try {
       const p = params as Record<string, unknown>;
       const text = String(p.text || "").trim();
       const context = typeof p.context === "string" ? p.context : undefined;
@@ -547,6 +556,13 @@ export function createAlignmentCheckTool(input: { config: LcmConfig }): AnyAgent
         profile: evaluation.profile,
         signals: evaluation.signals,
       });
+      } catch (err) {
+        console.error("[alignment_check] unexpected error:", err);
+        return jsonResult({
+          error: "Alignment check failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }
@@ -567,6 +583,7 @@ export function createAlignmentDriftTool(input: { config: LcmConfig }): AnyAgent
       ),
     }),
     async execute(_toolCallId, params) {
+      try {
       const p = params as Record<string, unknown>;
       const windowDays =
         typeof p.windowDays === "number" && Number.isFinite(p.windowDays)
@@ -598,6 +615,13 @@ export function createAlignmentDriftTool(input: { config: LcmConfig }): AnyAgent
         profile: DEFAULT_PROFILE,
         drift,
       });
+      } catch (err) {
+        console.error("[alignment_drift] unexpected error:", err);
+        return jsonResult({
+          error: "Alignment drift check failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

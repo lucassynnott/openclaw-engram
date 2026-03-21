@@ -88,20 +88,34 @@ function toPosix(value: string): string {
 }
 
 function ensureDir(dirPath: string): void {
-  fs.mkdirSync(dirPath, { recursive: true });
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+  } catch (err) {
+    console.warn(`[native-file-sync] mkdirSync failed for ${dirPath}:`, err);
+  }
 }
 
 function readUtf8IfExists(filePath: string): string {
   if (!filePath || !fs.existsSync(filePath)) return "";
-  return fs.readFileSync(filePath, "utf8");
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch (err) {
+    console.warn(`[native-file-sync] readFileSync failed for ${filePath}:`, err);
+    return "";
+  }
 }
 
 function writeIfChanged(filePath: string, content: string): boolean {
   const next = content.endsWith("\n") ? content : `${content}\n`;
   const existing = readUtf8IfExists(filePath);
   if (existing === next) return false;
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, next, "utf8");
+  try {
+    ensureDir(path.dirname(filePath));
+    fs.writeFileSync(filePath, next, "utf8");
+  } catch (err) {
+    console.warn(`[native-file-sync] writeFileSync failed for ${filePath}:`, err);
+    return false;
+  }
   return true;
 }
 
@@ -374,7 +388,14 @@ function listRelevantFiles(rootDir: string): string[] {
   if (!rootDir || !fs.existsSync(rootDir)) return [];
   const out: string[] = [];
   const walk = (currentDir: string): void => {
-    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (err) {
+      console.warn(`[native-file-sync] readdirSync failed for ${currentDir}:`, err);
+      return;
+    }
+    for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {
         walk(fullPath);

@@ -491,21 +491,30 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
         });
       }
 
-      const search = await fetchMemoryCandidates(db, {
-        config: input.config,
-        query,
-        topK,
-        minScore,
-        maxTokens,
-        scope,
-        allScopes,
-        includeArchived,
-        archiveFallback: input.config.recallArchiveFallback,
-        entityLockEnabled: input.config.recallEntityLockEnabled,
-        entityId,
-        afterDate,
-        beforeDate,
-      });
+      let search: Awaited<ReturnType<typeof fetchMemoryCandidates>>;
+      try {
+        search = await fetchMemoryCandidates(db, {
+          config: input.config,
+          query,
+          topK,
+          minScore,
+          maxTokens,
+          scope,
+          allScopes,
+          includeArchived,
+          archiveFallback: input.config.recallArchiveFallback,
+          entityLockEnabled: input.config.recallEntityLockEnabled,
+          entityId,
+          afterDate,
+          beforeDate,
+        });
+      } catch (err) {
+        console.error("[memory_query] recall failed:", err);
+        return jsonResult({
+          error: "Memory query recall failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       const resultText =
         search.memories.length > 0

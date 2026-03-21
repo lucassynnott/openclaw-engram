@@ -125,14 +125,16 @@ describe("Person Content Scoring", () => {
     });
 
     it("returns valid score structure", () => {
-      const result = scorePersonContent({ content: "Sarah is a software engineer" });
+      // Multi-word names are valid person candidates
+      const result = scorePersonContent({ content: "Sarah Chen is a software engineer" });
       expect(result).not.toBeNull();
       expect(result).toHaveProperty("score");
       expect(result).toHaveProperty("role");
     });
 
     it("scores person content highly", () => {
-      const result = scorePersonContent({ content: "Alice is a product manager who works at Google" });
+      // Multi-word names are valid person candidates
+      const result = scorePersonContent({ content: "Alice Johnson is a product manager who works at Google" });
       expect(result).not.toBeNull();
       if (result) {
         expect(result.score).toBeGreaterThan(0);
@@ -170,12 +172,19 @@ describe("Person Content Scoring", () => {
     });
 
     it("handles content with entity candidates", () => {
-      const result = scorePersonContent({ content: "Alice is working on the project" });
+      // Multi-word names are valid person candidates; single-word "Alice" alone is not
+      const result = scorePersonContent({ content: "Alice Morgan is working on the project" });
       expect(result).not.toBeNull();
       if (result) {
         expect(result.score).toBeGreaterThan(0);
         expect(result.role).toBe("general");
       }
+    });
+
+    it("rejects single-word names without explicit context", () => {
+      // Single capitalized words should NOT produce person candidates
+      const result = scorePersonContent({ content: "Building is important for Products" });
+      expect(result).toBeNull();
     });
 
     it("respects entity keys filter", () => {
@@ -238,7 +247,7 @@ describe("Person Store Management", () => {
       expect(() => rebuildEntityMentions(db)).not.toThrow();
     });
 
-    it("filters sentence-start noise tokens while keeping real names", () => {
+    it("filters sentence-start noise tokens while keeping real multi-word names", () => {
       const db = createTestDb();
       ensurePersonStore(db);
       db.exec(`
@@ -251,7 +260,7 @@ describe("Person Store Management", () => {
         "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
       ).run(
         "sum-noise-1",
-        "Always ask Sarah before you search tools. Don't page Lucas unless the migration is blocked.",
+        "Always ask Sarah Chen before you search tools. Don't page Lucas Synnott unless the migration is blocked.",
       );
 
       rebuildEntityMentions(db);
@@ -261,12 +270,69 @@ describe("Person Store Management", () => {
         .all() as Array<{ entity_key: string }>;
       const keys = rows.map((row) => row.entity_key);
 
-      expect(keys).toContain("sarah");
-      expect(keys).toContain("lucas");
+      expect(keys).toContain("sarah chen");
+      expect(keys).toContain("lucas synnott");
       expect(keys).not.toContain("always");
       expect(keys).not.toContain("search");
       expect(keys).not.toContain("tools");
       expect(keys).not.toContain("don");
+    });
+
+    it("extracts single-word names only from explicit relationship context", () => {
+      const db = createTestDb();
+      ensurePersonStore(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
+      ).run(
+        "sum-rel-1",
+        "My girlfriend Sarah confirmed the appointment.",
+      );
+
+      rebuildEntityMentions(db);
+
+      const rows = db
+        .prepare("SELECT entity_key FROM entity_mentions ORDER BY entity_key ASC")
+        .all() as Array<{ entity_key: string }>;
+      const keys = rows.map((row) => row.entity_key);
+
+      // "Sarah" extracted via relationship pattern "girlfriend Sarah"
+      expect(keys).toContain("sarah");
+    });
+
+    it("rejects single capitalized words that are not in an entity context", () => {
+      const db = createTestDb();
+      ensurePersonStore(db);
+      db.exec(`
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          content TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
+      ).run(
+        "sum-garbage-1",
+        "Building the Products pipeline. The Orchestrator handles Alignment checks. Silverhand runs the sync.",
+      );
+
+      rebuildEntityMentions(db);
+
+      const rows = db
+        .prepare("SELECT entity_key FROM entity_mentions ORDER BY entity_key ASC")
+        .all() as Array<{ entity_key: string }>;
+      const keys = rows.map((row) => row.entity_key);
+
+      expect(keys).not.toContain("building");
+      expect(keys).not.toContain("products");
+      expect(keys).not.toContain("orchestrator");
+      expect(keys).not.toContain("alignment");
+      expect(keys).not.toContain("silverhand");
     });
 
     it("rejects common English command/state words as entity candidates", () => {
@@ -282,7 +348,7 @@ describe("Person Store Management", () => {
         "INSERT INTO summaries (summary_id, content) VALUES (?, ?)",
       ).run(
         "sum-noise-2",
-        "Store the vectors now. Currently the gateway is healthy. Out of caution, Lucas will verify backups.",
+        "Store the vectors now. Currently the gateway is healthy. Out of caution, Lucas Synnott will verify backups.",
       );
 
       rebuildEntityMentions(db);
@@ -292,7 +358,7 @@ describe("Person Store Management", () => {
         .all() as Array<{ entity_key: string }>;
       const keys = rows.map((row) => row.entity_key);
 
-      expect(keys).toContain("lucas");
+      expect(keys).toContain("lucas synnott");
       expect(keys).not.toContain("store");
       expect(keys).not.toContain("currently");
       expect(keys).not.toContain("out");
@@ -324,7 +390,9 @@ describe("Person Store Management", () => {
         .all() as Array<{ entity_key: string; role: string }>;
       const byKey = new Map(rows.map((row) => [row.entity_key, row.role]));
 
+      // "Sarah" is extracted via relationship context ("girlfriend Sarah")
       expect(byKey.get("sarah")).toBe("relationship");
+      // "Codex" is a single capitalized word without entity context — should not be extracted
       expect(byKey.has("codex")).toBe(false);
     });
   });

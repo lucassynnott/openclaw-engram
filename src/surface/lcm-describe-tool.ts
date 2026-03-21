@@ -65,6 +65,7 @@ export function createLcmDescribeTool(input: {
       "token counts, and file exploration results.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
+      try {
       const retrieval = input.lcm.getRetrieval();
       const timezone = input.lcm.timezone;
       const p = params as Record<string, unknown>;
@@ -229,6 +230,13 @@ export function createLcmDescribeTool(input: {
       }
 
       return jsonResult(result);
+      } catch (err) {
+        console.error("[lcm_describe] unexpected error:", err);
+        return jsonResult({
+          error: "LCM describe failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

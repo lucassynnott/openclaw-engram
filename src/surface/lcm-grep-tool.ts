@@ -83,6 +83,7 @@ export function createLcmGrepTool(input: {
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
+      try {
       const retrieval = input.lcm.getRetrieval();
       const timezone = input.lcm.timezone;
 
@@ -195,6 +196,13 @@ export function createLcmGrepTool(input: {
           totalMatches: result.totalMatches,
         },
       };
+      } catch (err) {
+        console.error("[lcm_grep] unexpected error:", err);
+        return jsonResult({
+          error: "LCM grep failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

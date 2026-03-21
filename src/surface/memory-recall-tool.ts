@@ -113,7 +113,16 @@ export function createMemoryRecallTool(input: { config: LcmConfig }): AnyAgentTo
       `;
       queryParams.push(topK);
 
-      const rows = db.prepare(sql).all(...queryParams) as Array<Record<string, unknown>>;
+      let rows: Array<Record<string, unknown>>;
+      try {
+        rows = db.prepare(sql).all(...queryParams) as Array<Record<string, unknown>>;
+      } catch (err) {
+        console.error("[memory_recall] query failed:", err);
+        return jsonResult({
+          error: "Memory recall query failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       const grouped: Record<string, Array<{ id: string; content: string; confidence: number }>> =
         {};

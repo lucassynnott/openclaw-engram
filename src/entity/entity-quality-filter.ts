@@ -518,7 +518,7 @@ const COMMON_ENGLISH_WORDS = new Set([
   "suspect", "suspension", "suspicion", "swap", "sweep",
   "swing", "sword", "symbol", "sympathy", "syndrome",
   "syntax", "system",
-  "table", "tablet", "tactic", "tail", "tale", "talent", "tank",
+  "table", "tablet", "tactic", "tail", "tale", "talent", "tank", "task", "tasks",
   "tape", "tea", "teacher", "team", "tear", "technique",
   "technology", "telephone", "telescope", "television",
   "temperature", "temple", "tendency", "tension", "tent", "tenure",
@@ -799,6 +799,11 @@ const COMMON_ENGLISH_WORDS = new Set([
   "thinking", "tightening", "triage",
   "uncommitted",
   "weekend", "woke",
+
+  // -- Backstop: specific single-word garbage entities observed in production --
+  "don", "alignment", "home", "sync", "silverhand",
+  "agentic", "hermes", "manis", "utari",
+  "acuff", "cannell", "howes", "toshniwal",
 ]);
 
 // ---------------------------------------------------------------------------

@@ -1648,10 +1648,14 @@ export const inspectVaultHealth = ({
   const manualIssues: string[] = [];
   for (const folder of manualFolders) {
     const folderPath = path.join(mirrorRoot, folder);
-    if (
-      !fs.existsSync(folderPath) ||
-      !fs.statSync(folderPath).isDirectory()
-    ) {
+    try {
+      if (
+        !fs.existsSync(folderPath) ||
+        !fs.statSync(folderPath).isDirectory()
+      ) {
+        manualIssues.push(`missing manual folder: ${folder}`);
+      }
+    } catch {
       manualIssues.push(`missing manual folder: ${folder}`);
     }
   }

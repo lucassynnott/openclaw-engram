@@ -129,6 +129,9 @@ function makeConfig(databasePath: string): LcmConfig {
     vectorEmbeddingModel: "text-embedding-3-small",
     vectorEmbeddingProvider: "openai",
     vaultSyncIntervalHours: 24,
+    episodeRetentionDays: 7,
+    heartbeatDedupeThreshold: 0.7,
+    fragmentMinContentChars: 50,
   };
 }
 

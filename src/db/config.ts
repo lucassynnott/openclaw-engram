@@ -79,6 +79,9 @@ export type LcmConfig = {
   vectorEmbeddingModel: string;
   vectorEmbeddingProvider: string;
   vaultSyncIntervalHours: number;
+  episodeRetentionDays: number;
+  heartbeatDedupeThreshold: number;
+  fragmentMinContentChars: number;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -734,6 +737,27 @@ export function resolveLcmConfig(
       ["ENGRAM_VAULT_SYNC_INTERVAL_HOURS"],
       ["vault.syncIntervalHours", "vaultSyncIntervalHours"],
       24,
+    ),
+    episodeRetentionDays: readNumber(
+      env,
+      pc,
+      ["ENGRAM_EPISODE_RETENTION_DAYS"],
+      ["hygiene.episodeRetentionDays", "episodeRetentionDays"],
+      7,
+    ),
+    heartbeatDedupeThreshold: readNumber(
+      env,
+      pc,
+      ["ENGRAM_HEARTBEAT_DEDUPE_THRESHOLD"],
+      ["hygiene.heartbeatDedupeThreshold", "heartbeatDedupeThreshold"],
+      0.7,
+    ),
+    fragmentMinContentChars: readNumber(
+      env,
+      pc,
+      ["ENGRAM_FRAGMENT_MIN_CONTENT_CHARS"],
+      ["hygiene.fragmentMinContentChars", "fragmentMinContentChars"],
+      50,
     ),
   };
 }

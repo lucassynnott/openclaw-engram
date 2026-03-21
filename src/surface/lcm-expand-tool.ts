@@ -170,6 +170,7 @@ export function createLcmExpandTool(input: {
       "with cited IDs for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
+      try {
       const retrieval = input.lcm.getRetrieval();
       const orchestrator = new ExpansionOrchestrator(retrieval);
       const runtimeAuthManager = getRuntimeExpansionAuthManager();
@@ -519,6 +520,13 @@ export function createLcmExpandTool(input: {
       return jsonResult({
         error: "Either summaryIds or query must be provided.",
       });
+      } catch (err) {
+        console.error("[lcm_expand] unexpected error:", err);
+        return jsonResult({
+          error: "LCM expand failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

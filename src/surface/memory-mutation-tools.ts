@@ -6,6 +6,7 @@ import { getLcmConnection } from "../db/connection.js";
 import { resolveSourceAgentIdFromSessionContext } from "../memory/agent-namespace.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { upsertMemoryTrigger } from "../memory/memory-triggers.js";
+import { runMemoryHygiene } from "../memory/memory-hygiene.js";
 import { syncNativeMemoryLayer } from "../memory/native-file-sync.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
@@ -65,10 +66,14 @@ function syncNativeIfEnabled(config: LcmConfig, resolveAgentDir?: () => string):
   if (!rootDir) {
     return null;
   }
-  syncNativeMemoryLayer({
-    db: openDb(config),
-    rootDir,
-  });
+  const db = openDb(config);
+  syncNativeMemoryLayer({ db, rootDir });
+  // Run memory hygiene (stale episode archival, fragment cleanup) after sync
+  try {
+    runMemoryHygiene({ db, config });
+  } catch {
+    // Hygiene is best-effort; don't fail the sync
+  }
   return rootDir;
 }
 
@@ -85,6 +90,7 @@ export function createMemoryRetractTool(input: {
       "Mark an existing memory as superseded/retracted so it stops surfacing in normal recall.",
     parameters: MemoryRetractSchema,
     async execute(_toolCallId, params) {
+      try {
       const p = params as Record<string, unknown>;
       const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
       if (!memoryId) {
@@ -94,7 +100,16 @@ export function createMemoryRetractTool(input: {
         };
       }
 
-      const db = openDb(input.config);
+      let db: DatabaseSync;
+      try {
+        db = openDb(input.config);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: "Memory store unavailable." }],
+          details: { error: "db_unavailable", detail: err instanceof Error ? err.message : String(err) },
+        };
+      }
+
       const row = loadMemoryRow(db, memoryId);
       if (!row) {
         return {
@@ -151,6 +166,13 @@ export function createMemoryRetractTool(input: {
           nativeSyncRoot,
         },
       };
+      } catch (err) {
+        console.error("[memory_retract] unexpected error:", err);
+        return {
+          content: [{ type: "text", text: "Memory retract failed unexpectedly." }],
+          details: { error: "unexpected", detail: err instanceof Error ? err.message : String(err) },
+        };
+      }
     },
   };
 }
@@ -168,6 +190,7 @@ export function createMemoryCorrectTool(input: {
       "Create a corrected replacement memory and supersede the original memory with an explicit link.",
     parameters: MemoryCorrectSchema,
     async execute(_toolCallId, params) {
+      try {
       const p = params as Record<string, unknown>;
       const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
       const content = typeof p.content === "string" ? p.content.trim() : "";
@@ -178,7 +201,16 @@ export function createMemoryCorrectTool(input: {
         };
       }
 
-      const db = openDb(input.config);
+      let db: DatabaseSync;
+      try {
+        db = openDb(input.config);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: "Memory store unavailable." }],
+          details: { error: "db_unavailable", detail: err instanceof Error ? err.message : String(err) },
+        };
+      }
+
       const row = loadMemoryRow(db, memoryId);
       if (!row) {
         return {
@@ -253,12 +285,16 @@ export function createMemoryCorrectTool(input: {
 
       const triggerPattern = typeof p.triggerPattern === "string" ? p.triggerPattern.trim() : "";
       if (triggerPattern) {
-        upsertMemoryTrigger({
-          db,
-          memoryId: corrected.memoryId,
-          pattern: triggerPattern,
-          metadata: { created_by: "memory_correct" },
-        });
+        try {
+          upsertMemoryTrigger({
+            db,
+            memoryId: corrected.memoryId,
+            pattern: triggerPattern,
+            metadata: { created_by: "memory_correct" },
+          });
+        } catch (err) {
+          console.warn("[memory_correct] upsertMemoryTrigger failed (non-fatal):", err);
+        }
       }
 
       let nativeSyncRoot: string | null = null;
@@ -290,6 +326,13 @@ export function createMemoryCorrectTool(input: {
           nativeSyncRoot,
         },
       };
+      } catch (err) {
+        console.error("[memory_correct] unexpected error:", err);
+        return {
+          content: [{ type: "text", text: "Memory correct failed unexpectedly." }],
+          details: { error: "unexpected", detail: err instanceof Error ? err.message : String(err) },
+        };
+      }
     },
   };
 }

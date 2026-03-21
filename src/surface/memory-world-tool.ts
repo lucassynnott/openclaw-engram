@@ -96,9 +96,16 @@ export function createMemoryWorldTool(input: { config: LcmConfig }): AnyAgentToo
       `;
       queryParams.push(limit);
 
-      const entities = db.prepare(entitySql).all(...queryParams) as Array<
-        Record<string, unknown>
-      >;
+      let entities: Array<Record<string, unknown>>;
+      try {
+        entities = db.prepare(entitySql).all(...queryParams) as Array<Record<string, unknown>>;
+      } catch (err) {
+        console.error("[memory_world] entity query failed:", err);
+        return jsonResult({
+          error: "Memory world query failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       let result: Array<Record<string, unknown>>;
 
@@ -114,9 +121,14 @@ export function createMemoryWorldTool(input: { config: LcmConfig }): AnyAgentToo
             LIMIT 5
           `;
           const namePattern = `%${e.display_name}%`;
-          const memories = db
-            .prepare(taggedSql)
-            .all(namePattern, namePattern) as Array<Record<string, unknown>>;
+          let memories: Array<Record<string, unknown>> = [];
+          try {
+            memories = db
+              .prepare(taggedSql)
+              .all(namePattern, namePattern) as Array<Record<string, unknown>>;
+          } catch (err) {
+            console.warn("[memory_world] entity memory lookup failed (non-fatal):", err);
+          }
 
           return {
             id: e.entity_id,

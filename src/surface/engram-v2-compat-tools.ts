@@ -498,7 +498,13 @@ function walkMirrorFiles(root: string, maxFiles = 2000): string[] {
   const stack = [root];
   while (stack.length > 0 && results.length < maxFiles) {
     const current = stack.pop() as string;
-    const entries = readdirSync(current, { withFileTypes: true });
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch (err) {
+      console.warn(`[walkMirrorFiles] readdirSync failed for ${current}:`, err);
+      continue;
+    }
     for (const entry of entries) {
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
@@ -539,11 +545,21 @@ function searchVaultMirror(params: {
       continue;
     }
 
-    const stats = statSync(filePath);
+    let stats: import("node:fs").Stats;
+    try {
+      stats = statSync(filePath);
+    } catch {
+      continue;
+    }
     if (stats.size > 1_000_000) {
       continue;
     }
-    const content = readFileSync(filePath, "utf8");
+    let content: string;
+    try {
+      content = readFileSync(filePath, "utf8");
+    } catch {
+      continue;
+    }
     const haystack = `${relativePath}\n${content}`.toLowerCase();
     if (normalizedQuery && !haystack.includes(normalizedQuery)) {
       continue;

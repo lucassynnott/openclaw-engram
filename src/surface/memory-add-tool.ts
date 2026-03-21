@@ -5,6 +5,7 @@ import { getLcmConnection } from "../db/connection.js";
 import { isLikelyEntityName } from "../entity/entity-quality-filter.js";
 import { ensureWorldModelReady, findEntityMatches } from "../entity/world-model.js";
 import { resolveSourceAgentIdFromSessionContext } from "../memory/agent-namespace.js";
+import { runMemoryHygiene } from "../memory/memory-hygiene.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { upsertMemoryTrigger } from "../memory/memory-triggers.js";
 import {
@@ -14,10 +15,13 @@ import {
 } from "../memory/native-file-sync.js";
 import {
   classifyValue,
+  CONTENT_LENGTH_SOFT_MAX,
   detectJunk,
+  detectSystemPromptArtifact,
   hasTemporalContext,
   hashNormalized,
   inferKind,
+  isHeartbeatPattern,
   normalizeContent,
   type MemoryKind,
   type ValueLabel,
@@ -218,10 +222,15 @@ function findSemanticDuplicate(params: {
   kind: MemoryKind;
   sourceSession?: string;
   dedupeMode: "none" | "global" | "session";
+  threshold?: number;
 }): { memoryId: string; similarity: number } | undefined {
   if (params.dedupeMode === "none") {
     return undefined;
   }
+
+  const effectiveThreshold = typeof params.threshold === "number" && Number.isFinite(params.threshold)
+    ? params.threshold
+    : SEMANTIC_DEDUPE_THRESHOLD;
 
   const where = ["status = 'active'", "scope = ?", "type = ?"];
   const queryParams: Array<string | number> = [params.scope, params.kind];
@@ -246,7 +255,7 @@ function findSemanticDuplicate(params: {
   let best: { memoryId: string; similarity: number } | undefined;
   for (const row of rows) {
     const similarity = overlapSimilarity(params.content, String(row.content || ""));
-    if (similarity < SEMANTIC_DEDUPE_THRESHOLD) {
+    if (similarity < effectiveThreshold) {
       continue;
     }
     if (!best || similarity > best.similarity) {
@@ -294,8 +303,28 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
     return { stored: false, reason: "missing_content", content: params.content };
   }
 
-  ensureCompatColumns(params.config);
-  const db = getLcmConnection(params.config.databasePath);
+  try {
+    ensureCompatColumns(params.config);
+  } catch (err) {
+    console.error("[storeMemory] ensureCompatColumns failed:", err);
+    return {
+      stored: false,
+      reason: "db_error",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  let db: ReturnType<typeof getLcmConnection>;
+  try {
+    db = getLcmConnection(params.config.databasePath);
+  } catch (err) {
+    console.error("[storeMemory] DB connection failed:", err);
+    return {
+      stored: false,
+      reason: "db_unavailable",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
 
   const rawKind = typeof params.kind === "string" ? params.kind.trim().toUpperCase() : "";
   const kind: MemoryKind = VALID_KINDS.includes(rawKind as MemoryKind)
@@ -325,6 +354,25 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
   }
 
   const baselineConfidence = resolveConfidence(params.confidence, 0.75);
+
+  // Soft content-length gate: automated captures over the soft max need
+  // higher confidence to survive.  Manual (`source === "manual"`) stores
+  // bypass this gate because the user explicitly asked for it.
+  const isManual = (params.source?.trim() || "manual") === "manual";
+  if (
+    !isManual &&
+    content.length > CONTENT_LENGTH_SOFT_MAX &&
+    baselineConfidence < 0.85
+  ) {
+    return {
+      stored: false,
+      reason: "rejected_quality_gate",
+      gate: "content_length_soft",
+      detail: `content length ${content.length} exceeds soft max ${CONTENT_LENGTH_SOFT_MAX} with confidence ${baselineConfidence.toFixed(2)} (need >= 0.85)`,
+      content,
+    };
+  }
+
   const classification = classifyValue(content, kind, baselineConfidence);
   const isTemporalEpisode = kind === "EPISODE" || hasTemporalContext(content);
   const effectiveKind = isTemporalEpisode && kind !== "EPISODE" && hasTemporalContext(content)
@@ -366,6 +414,13 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
       scope,
     };
   }
+  // Use a lower dedupe threshold for heartbeat-pattern EPISODE entries
+  // so near-identical status logs get caught even with slight wording differences.
+  const heartbeatThreshold =
+    effectiveKind === "EPISODE" && isHeartbeatPattern(content)
+      ? params.config.heartbeatDedupeThreshold
+      : undefined;
+
   const semanticDuplicate = findSemanticDuplicate({
     db,
     content,
@@ -373,6 +428,7 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
     kind: effectiveKind,
     sourceSession: params.sourceSession,
     dedupeMode: params.dedupeMode ?? "global",
+    threshold: heartbeatThreshold,
   });
   if (semanticDuplicate) {
     return {
@@ -398,114 +454,138 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
       : null;
   const contentTime = params.contentTime?.trim() || null;
 
-  db.prepare(`
-    INSERT INTO memory_current (
-      memory_id, type, content, normalized, normalized_hash,
-      source, source_agent, source_session, source_trigger, confidence, scope, status,
-      value_score, value_label,
-      created_at, updated_at, archived_at, tags, provenance,
-      content_time, source_layer, source_path, source_line
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    memoryId,
-    effectiveKind,
-    content,
-    normalized,
-    normalizedHash,
-    source,
-    params.sourceAgent?.trim() || null,
-    params.sourceSession?.trim() || null,
-    sourceTrigger,
-    baselineConfidence,
-    scope,
-    status,
-    classification.value_score,
-    classification.value_label,
-    now,
-    now,
-    archivedAt,
-    tags,
-    provenance,
-    contentTime,
-    sourceLayer,
-    sourcePath,
-    sourceLine,
-  );
+  try {
+    db.prepare(`
+      INSERT INTO memory_current (
+        memory_id, type, content, normalized, normalized_hash,
+        source, source_agent, source_session, source_trigger, confidence, scope, status,
+        value_score, value_label,
+        created_at, updated_at, archived_at, tags, provenance,
+        content_time, source_layer, source_path, source_line
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      memoryId,
+      effectiveKind,
+      content,
+      normalized,
+      normalizedHash,
+      source,
+      params.sourceAgent?.trim() || null,
+      params.sourceSession?.trim() || null,
+      sourceTrigger,
+      baselineConfidence,
+      scope,
+      status,
+      classification.value_score,
+      classification.value_label,
+      now,
+      now,
+      archivedAt,
+      tags,
+      provenance,
+      contentTime,
+      sourceLayer,
+      sourcePath,
+      sourceLine,
+    );
+  } catch (err) {
+    console.error("[storeMemory] INSERT memory_current failed:", err);
+    return {
+      stored: false,
+      reason: "db_write_error",
+      detail: err instanceof Error ? err.message : String(err),
+      kind: effectiveKind,
+      scope,
+    };
+  }
 
   let episodeId: string | null = null;
   if (isTemporalEpisode) {
-    episodeId = `ep_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const title = content.length > 80 ? `${content.slice(0, 77)}...` : content;
-    db.prepare(`
-      INSERT INTO memory_episodes (
-        episode_id, title, summary, start_date, end_date, status,
-        source_memory_ids, payload
-      ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)
-    `).run(
-      episodeId,
-      title,
-      content,
-      contentTime,
-      contentTime,
-      JSON.stringify([memoryId]),
-      JSON.stringify({
-        source,
-        source_session: params.sourceSession ?? undefined,
-        source_agent: params.sourceAgent ?? undefined,
-        component,
-      }),
-    );
+    try {
+      episodeId = `ep_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      const title = content.length > 80 ? `${content.slice(0, 77)}...` : content;
+      db.prepare(`
+        INSERT INTO memory_episodes (
+          episode_id, title, summary, start_date, end_date, status,
+          source_memory_ids, payload
+        ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)
+      `).run(
+        episodeId,
+        title,
+        content,
+        contentTime,
+        contentTime,
+        JSON.stringify([memoryId]),
+        JSON.stringify({
+          source,
+          source_session: params.sourceSession ?? undefined,
+          source_agent: params.sourceAgent ?? undefined,
+          component,
+        }),
+      );
+    } catch (err) {
+      console.warn("[storeMemory] INSERT memory_episodes failed (non-fatal):", err);
+      episodeId = null;
+    }
   }
 
   const linkedEntityIds: string[] = [];
   if (resolvedEntities.length > 0) {
     for (const entityName of resolvedEntities) {
-      const normalizedName = entityName.toLowerCase().trim();
-      // Filter out common English words that are not real entity names
-      if (!isLikelyEntityName(normalizedName)) continue;
-      const existing = db
-        .prepare("SELECT entity_id FROM memory_entities WHERE normalized_name = ? LIMIT 1")
-        .get(normalizedName) as { entity_id: string } | undefined;
-      if (existing) {
-        linkedEntityIds.push(existing.entity_id);
-        db.prepare("UPDATE memory_entities SET updated_at = ? WHERE entity_id = ?")
-          .run(now, existing.entity_id);
-      } else {
-        const entityId = `ent_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-        db.prepare(`
-          INSERT INTO memory_entities (
-            entity_id, kind, display_name, normalized_name, status, confidence, created_at, updated_at
-          ) VALUES (?, 'person', ?, ?, 'active', 0.7, ?, ?)
-        `).run(entityId, entityName, normalizedName, now, now);
-        linkedEntityIds.push(entityId);
+      try {
+        const normalizedName = entityName.toLowerCase().trim();
+        // Filter out common English words that are not real entity names
+        if (!isLikelyEntityName(normalizedName)) continue;
+        const existing = db
+          .prepare("SELECT entity_id FROM memory_entities WHERE normalized_name = ? LIMIT 1")
+          .get(normalizedName) as { entity_id: string } | undefined;
+        if (existing) {
+          linkedEntityIds.push(existing.entity_id);
+          db.prepare("UPDATE memory_entities SET updated_at = ? WHERE entity_id = ?")
+            .run(now, existing.entity_id);
+        } else {
+          const entityId = `ent_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+          db.prepare(`
+            INSERT INTO memory_entities (
+              entity_id, kind, display_name, normalized_name, status, confidence, created_at, updated_at
+            ) VALUES (?, 'person', ?, ?, 'active', 0.7, ?, ?)
+          `).run(entityId, entityName, normalizedName, now, now);
+          linkedEntityIds.push(entityId);
+        }
+      } catch (err) {
+        console.warn(`[storeMemory] entity linking failed for "${entityName}" (non-fatal):`, err);
       }
     }
   }
 
-  db.prepare(`
-    INSERT INTO memory_events (event_id, timestamp, component, action, memory_id, source, payload)
-    VALUES (?, ?, ?, 'store', ?, ?, ?)
-  `).run(
-    randomUUID(),
-    now,
-    component,
-    memoryId,
-    source,
-    JSON.stringify({
-      kind: effectiveKind,
-      scope,
-      source_trigger: sourceTrigger ?? undefined,
-      value_label: classification.value_label,
-      value_score: classification.value_score,
-      reason_codes: classification.reason_codes,
-      episode_id: episodeId ?? undefined,
-      entity_ids: linkedEntityIds.length > 0 ? linkedEntityIds : undefined,
-      provenance: params.provenance,
-      source_layer: sourceLayer,
-      source_path: sourcePath ?? undefined,
-      source_line: sourceLine ?? undefined,
-    }),
-  );
+  try {
+    db.prepare(`
+      INSERT INTO memory_events (event_id, timestamp, component, action, memory_id, source, payload)
+      VALUES (?, ?, ?, 'store', ?, ?, ?)
+    `).run(
+      randomUUID(),
+      now,
+      component,
+      memoryId,
+      source,
+      JSON.stringify({
+        kind: effectiveKind,
+        scope,
+        source_trigger: sourceTrigger ?? undefined,
+        value_label: classification.value_label,
+        value_score: classification.value_score,
+        reason_codes: classification.reason_codes,
+        episode_id: episodeId ?? undefined,
+        entity_ids: linkedEntityIds.length > 0 ? linkedEntityIds : undefined,
+        provenance: params.provenance,
+        source_layer: sourceLayer,
+        source_path: sourcePath ?? undefined,
+        source_line: sourceLine ?? undefined,
+      }),
+    );
+  } catch (err) {
+    console.warn("[storeMemory] INSERT memory_events failed (non-fatal):", err);
+  }
 
   return {
     stored: true,
@@ -535,6 +615,7 @@ export function createMemoryAddTool(input: {
       "Content passes quality gates before storage. Temporal content is automatically stored as an episode.",
     parameters: MemoryAddSchema,
     async execute(_toolCallId, params) {
+      try {
       const p = params as Record<string, unknown>;
       const content = typeof p.content === "string" ? p.content.trim() : "";
       if (!content) {
@@ -641,16 +722,20 @@ export function createMemoryAddTool(input: {
       let nativeSync: Pick<NativeSyncResult, "rootDir" | "filesWritten" | "dailyNoteCount" | "paraFolderCount"> | null = null;
       if (nativeRoot) {
         try {
-          const sync = syncNativeMemoryLayer({
-            db: getLcmConnection(input.config.databasePath),
-            rootDir: nativeRoot,
-          });
+          const db = getLcmConnection(input.config.databasePath);
+          const sync = syncNativeMemoryLayer({ db, rootDir: nativeRoot });
           nativeSync = {
             rootDir: sync.rootDir,
             filesWritten: sync.filesWritten,
             dailyNoteCount: sync.dailyNoteCount,
             paraFolderCount: sync.paraFolderCount,
           };
+          // Run memory hygiene (stale episode archival, fragment cleanup) after sync
+          try {
+            runMemoryHygiene({ db, config: input.config });
+          } catch {
+            // Hygiene is best-effort; don't fail the store operation
+          }
         } catch (err) {
           nativeSyncWarning = err instanceof Error ? err.message : String(err);
         }
@@ -687,6 +772,13 @@ export function createMemoryAddTool(input: {
           triggerIds,
         },
       };
+      } catch (err) {
+        console.error("[memory_add] unexpected error:", err);
+        return jsonResult({
+          error: "Memory add failed unexpectedly.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

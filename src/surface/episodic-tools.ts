@@ -48,25 +48,45 @@ export function createMemoryGetEntityTool(input: { config: LcmConfig }): AnyAgen
           detail: err instanceof Error ? err.message : String(err),
         });
       }
-      ensureMemoryTables(db);
+      try {
+        ensureMemoryTables(db);
+      } catch (err) {
+        return jsonResult({
+          error: "Memory schema initialization failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
-      const entity = db
-        .prepare("SELECT * FROM memory_entities WHERE entity_id = ?")
-        .get(entityId) as Record<string, unknown> | undefined;
+      let entity: Record<string, unknown> | undefined;
+      try {
+        entity = db
+          .prepare("SELECT * FROM memory_entities WHERE entity_id = ?")
+          .get(entityId) as Record<string, unknown> | undefined;
+      } catch (err) {
+        return jsonResult({
+          error: "Entity query failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       if (!entity) {
         return jsonResult({ error: `Entity not found: ${entityId}` });
       }
 
-      const memories = db
-        .prepare(`
-          SELECT memory_id, type, content, confidence, created_at
-          FROM memory_current
-          WHERE status = 'active' AND (tags LIKE ? OR content LIKE ?)
-          ORDER BY confidence DESC
-          LIMIT 10
-        `)
-        .all(`%${entity.display_name}%`, `%${entity.display_name}%`) as Array<Record<string, unknown>>;
+      let memories: Array<Record<string, unknown>> = [];
+      try {
+        memories = db
+          .prepare(`
+            SELECT memory_id, type, content, confidence, created_at
+            FROM memory_current
+            WHERE status = 'active' AND (tags LIKE ? OR content LIKE ?)
+            ORDER BY confidence DESC
+            LIMIT 10
+          `)
+          .all(`%${entity.display_name}%`, `%${entity.display_name}%`) as Array<Record<string, unknown>>;
+      } catch (err) {
+        console.warn("[memory_get_entity] memory lookup failed (non-fatal):", err);
+      }
 
       return jsonResult({
         entity: {
@@ -120,11 +140,26 @@ export function createMemoryGetEpisodeTool(input: { config: LcmConfig }): AnyAge
           detail: err instanceof Error ? err.message : String(err),
         });
       }
-      ensureMemoryTables(db);
+      try {
+        ensureMemoryTables(db);
+      } catch (err) {
+        return jsonResult({
+          error: "Memory schema initialization failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
-      const episode = db
-        .prepare("SELECT * FROM memory_episodes WHERE episode_id = ?")
-        .get(episodeId) as Record<string, unknown> | undefined;
+      let episode: Record<string, unknown> | undefined;
+      try {
+        episode = db
+          .prepare("SELECT * FROM memory_episodes WHERE episode_id = ?")
+          .get(episodeId) as Record<string, unknown> | undefined;
+      } catch (err) {
+        return jsonResult({
+          error: "Episode query failed.",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       if (!episode) {
         return jsonResult({ error: `Episode not found: ${episodeId}` });

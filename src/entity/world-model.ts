@@ -58,6 +58,7 @@ const ENTITY_ALIAS_STOPWORDS = new Set([
   "january", "february", "march", "april", "may", "june", "july", "august",
   "september", "october", "november", "december", "jan", "feb", "mar", "apr",
   "jun", "jul", "aug", "sep", "oct", "nov", "dec", "today", "heute",
+  "don", "alignment", "home", "sync", "building", "products", "orchestrator", "silverhand",
 ]);
 const PERSON_ALIAS_NOISE_TOKENS = new Set([
   "active",
@@ -192,6 +193,12 @@ const PERSON_ALIAS_NOISE_TOKENS = new Set([
   "version",
   "working",
   "world",
+  "alignment",
+  "building",
+  "home",
+  "orchestrator",
+  "products",
+  "silverhand",
 ]);
 const RELATIONSHIP_LABEL_RE = /\b(partner(?:in)?|wife|husband|girlfriend|boyfriend|freund(?:in)?)\b/i;
 const PREFERENCE_POSITIVE_RE = /\b(?:prefer(?:s)?|like(?:s)?|love(?:s)?)\b/i;
@@ -227,7 +234,7 @@ const FLINT_RESPONSE_RE = /\b(?:flint(?:'s|'s)? name is mentioned|flint response
 const CURRENT_STATE_ALLOWED_TOPICS = new Set(["relationship", "location", "role", "preference", "project", "health"]);
 const STABLE_IDENTITY_SUBTOPICS = new Set(["preferred_name", "communication_style", "visual_identity"]);
 const DURABLE_PROJECT_SUBTOPICS = new Set(["investment_relation", "interview_status", "response_behavior", "food_image_comparison"]);
-const ENTITY_EXTRACTION_SCHEMA_VERSION = "2026-03-21-entity-quality-v3";
+const ENTITY_EXTRACTION_SCHEMA_VERSION = "2026-03-21-entity-quality-v4-multiword";
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -1290,6 +1297,20 @@ const evaluateEntityCandidate = ({ entityKey = "", kind = "", aliases = [] as st
   // Common words like "work", "tools", "google", "claude" should never be
   // classified as entities of any kind (person, org, project, place, topic).
   if (!isLikelyEntityName(normalizedKey) && !explicitlyTagged && !explicitlyTyped) return { accepted: false, kind, aliases: filteredAliases, reason: "common_word_not_entity" };
+
+  // --- Structural: single-word person names require strong signals ---
+  // Single capitalized words like "Silverhand", "Building", "Products" are
+  // not valid person entities. Person entities must have >= 2 words in their
+  // name unless:
+  // - explicitly tagged by the user via memory_add with entity metadata
+  // - backed by curated (MEMORY.md) evidence
+  // - have a strong relationship or public-profile mention (e.g. "girlfriend Sarah")
+  if (kind === "person") {
+    const wordCount = normalizedKey.trim().split(/\s+/).filter(Boolean).length;
+    if (wordCount < 2 && !explicitlyTagged && !hasCuratedEvidence && !strongMention) {
+      return { accepted: false, kind, aliases: filteredAliases, reason: "single_word_person_rejected" };
+    }
+  }
 
   if (kind === "person") {
     const enoughEvidence = explicitlyTagged && strongName ? evidenceCount >= 1 : evidenceCount >= Math.max(surfaceConfig.minEvidence, 2);

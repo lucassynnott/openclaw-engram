@@ -172,8 +172,10 @@ const COMMON_ENGLISH_CONTENT_WORDS = new Set([
 ]);
 const COMMON_NON_PERSON_TOKENS = new Set([
   "active",
+  "alignment",
   "always",
   "broken",
+  "building",
   ...COMMON_ENGLISH_CONTENT_WORDS,
   "current",
   "currently",
@@ -185,16 +187,21 @@ const COMMON_NON_PERSON_TOKENS = new Set([
   "errors",
   "fixed",
   "healthy",
+  "home",
   "inactive",
   "issue",
   "issues",
   "latest",
+  "orchestrator",
   "out",
+  "products",
   "recent",
   "search",
+  "silverhand",
   "store",
   "stored",
   "stores",
+  "sync",
   "tool",
   "tools",
   "working",
@@ -374,22 +381,46 @@ const isLikelyStandaloneNameCandidate = (
   return true;
 };
 
+const MULTI_WORD_PROPER_NAME_RE = /\b[A-ZÄÖÜ][a-zäöüß]{1,}(?:\s+[A-ZÄÖÜ][a-zäöüß]{1,})+\b/g;
+
+const EXPLICIT_ENTITY_CONTEXT_RE =
+  /\b(?:person named|user named|named|called|known as|name is|meet|met)\s+([A-ZÄÖÜ][a-zäöüß]{2,})\b/gi;
+
 const splitNameCandidates = (value: unknown): string[] => {
   const text = String(value || "");
   const out = new Set<string>();
-  const proper = text.match(/\b[A-ZÄÖÜ][a-zäöüß]{2,}\b/g) || [];
-  for (const item of proper) {
+
+  // --- Multi-word capitalized sequences are strong name candidates ---
+  // e.g. "Lucas Synnott", "Johnny Silverhand", "Applied Leverage"
+  const multiWord = text.match(MULTI_WORD_PROPER_NAME_RE) || [];
+  for (const item of multiWord) {
     const normalized = normalizeContent(item);
-    if (!isSupportedSingleTokenNameCandidate(text, item, normalized)) continue;
+    if (!normalized || ENTITY_NOISE_STOPWORDS.has(normalized)) continue;
+    if (!isLikelyEntityName(normalized)) continue;
     out.add(normalized);
   }
 
+  // --- Single capitalized words are NOT valid person candidates ---
+  // Exception: they appear in an explicit entity context pattern
+  let match: RegExpExecArray | null;
+  const contextRe = new RegExp(EXPLICIT_ENTITY_CONTEXT_RE.source, EXPLICIT_ENTITY_CONTEXT_RE.flags);
+  while ((match = contextRe.exec(text)) !== null) {
+    const name = match[1];
+    if (!name) continue;
+    const normalized = normalizeContent(name);
+    if (!normalized || ENTITY_NOISE_STOPWORDS.has(normalized)) continue;
+    if (!isLikelyEntityName(normalized)) continue;
+    out.add(normalized);
+  }
+
+  // --- Relationship context patterns still extract single names ---
+  // e.g. "my girlfriend Sarah", "partner Anna"
   const relation =
     text.match(
       /\b(?:partner(?:in)?|friend|wife|husband|girlfriend|boyfriend)\s+([A-Za-zÄÖÜäöüß-]{3,})\b/gi,
     ) || [];
-  for (const match of relation) {
-    const name = match.split(/\s+/).slice(-1).join(" ");
+  for (const matchStr of relation) {
+    const name = matchStr.split(/\s+/).slice(-1).join(" ");
     if (!/^[A-ZÄÖÜ]/.test(name)) continue;
     const normalized = normalizeContent(name);
     if (!normalized || ENTITY_NOISE_STOPWORDS.has(normalized)) continue;
