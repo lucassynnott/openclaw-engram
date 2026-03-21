@@ -78,6 +78,7 @@ export type LcmConfig = {
   vectorDimensions: number;
   vectorEmbeddingModel: string;
   vectorEmbeddingProvider: string;
+  vaultSyncIntervalHours: number;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -726,6 +727,13 @@ export function resolveLcmConfig(
       ["ENGRAM_VECTOR_EMBEDDING_PROVIDER"],
       ["vector.embeddingProvider"],
       "openai",
+    ),
+    vaultSyncIntervalHours: readNumber(
+      env,
+      pc,
+      ["ENGRAM_VAULT_SYNC_INTERVAL_HOURS"],
+      ["vault.syncIntervalHours", "vaultSyncIntervalHours"],
+      24,
     ),
   };
 }

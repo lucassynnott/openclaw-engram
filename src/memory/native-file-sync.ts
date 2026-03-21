@@ -917,11 +917,29 @@ function chooseParaFolder(row: MemoryRow): { bucket: string; folder: string } {
   return { bucket: "resources", folder: firstTag || scopeSlug || "general" };
 }
 
+// --- MEMORY.md sync quality filters ---
+// These prevent bootstrap bloat by keeping the sync block small and durable.
+// EPISODEs (heartbeats, status logs) stay in engram DB for runtime query.
+// Long DECISIONs are status dumps, not real decisions.
+const SYNC_EXCLUDED_TYPES = new Set(["EPISODE"]);
+const SYNC_DECISION_MAX_CHARS = 200;
+const SYNC_TOTAL_MAX_CHARS = 6000;
+
 function renderMemoryMd(memories: MemoryRow[]): string {
-  const groups = groupBy(
-    memories.filter((row) => String(row.status || "").trim().toLowerCase() === "active"),
-    (row) => String(row.type || "CONTEXT"),
-  );
+  const filtered = memories
+    .filter((row) => String(row.status || "").trim().toLowerCase() === "active")
+    .filter((row) => !SYNC_EXCLUDED_TYPES.has(String(row.type || "").toUpperCase()))
+    .filter((row) => {
+      if (String(row.type || "").toUpperCase() === "DECISION" && row.content.length > SYNC_DECISION_MAX_CHARS) {
+        return false;
+      }
+      return true;
+    });
+
+  // Sort newest-first so the char cap keeps recent items and drops old ones.
+  filtered.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+
+  const groups = groupBy(filtered, (row) => String(row.type || "CONTEXT"));
   const orderedKinds = Array.from(groups.keys()).sort();
   const lines: string[] = [];
   lines.push("## Synced Memories");
@@ -932,12 +950,19 @@ function renderMemoryMd(memories: MemoryRow[]): string {
     lines.push("");
   }
 
+  let totalChars = 0;
   for (const kind of orderedKinds) {
     const rows = (groups.get(kind) || []).slice(0, 50);
+    const kindHeader = `### ${kind}\n\n`;
+    if (totalChars + kindHeader.length >= SYNC_TOTAL_MAX_CHARS) break;
+    totalChars += kindHeader.length;
     lines.push(`### ${kind}`);
     lines.push("");
     for (const row of rows) {
-      lines.push(`- [${kind}] ${escapeInlineComment(row.content)} <!-- engram:id=${row.memory_id} -->`);
+      const line = `- [${kind}] ${escapeInlineComment(row.content)} <!-- engram:id=${row.memory_id} -->`;
+      if (totalChars + line.length + 1 > SYNC_TOTAL_MAX_CHARS) break;
+      totalChars += line.length + 1;
+      lines.push(line);
     }
     lines.push("");
   }

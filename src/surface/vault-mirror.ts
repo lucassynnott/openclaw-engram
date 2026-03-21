@@ -75,6 +75,8 @@ export type VaultBuildSummary = {
   summary_count: number;
   leaf_summary_count: number;
   condensed_summary_count: number;
+  memory_count: number;
+  entity_count: number;
   copied_files: number;
   skipped_unchanged: number;
   removed_files: number;
@@ -180,6 +182,15 @@ interface EntityRow {
   confidence: number;
   created_at: string;
   updated_at: string;
+}
+
+interface EntityBeliefRow {
+  belief_id: string;
+  entity_id: string;
+  type: string;
+  content: string;
+  status: string;
+  confidence: number;
 }
 
 // ── Writer state ──────────────────────────────────────────────────────────────
@@ -541,7 +552,7 @@ const safeQueryAll = <T>(db: DatabaseSync, sql: string, ...params: (string | num
   }
 };
 
-const queryMemoryNodes = (db: DatabaseSync, limit = 200): MemoryRow[] =>
+const queryMemoryNodes = (db: DatabaseSync, limit = 5000): MemoryRow[] =>
   safeQueryAll<MemoryRow>(
     db,
     `SELECT memory_id, type, content, scope, confidence, value_score, tags, created_at, content_time
@@ -552,16 +563,27 @@ const queryMemoryNodes = (db: DatabaseSync, limit = 200): MemoryRow[] =>
     limit,
   );
 
-const queryEntities = (db: DatabaseSync): EntityRow[] =>
-  safeQueryAll<EntityRow>(
+const queryEntities = (db: DatabaseSync): EntityRow[] => {
+  // Try the canonical `entities` table first (world-model / migration path),
+  // then fall back to the older `memory_entities` table.
+  const rows = safeQueryAll<EntityRow>(
+    db,
+    `SELECT entity_id, kind, display_name, confidence, created_at, updated_at
+     FROM entities
+     WHERE status = 'active'
+     ORDER BY confidence DESC, updated_at DESC`,
+  );
+  if (rows.length > 0) return rows;
+  return safeQueryAll<EntityRow>(
     db,
     `SELECT entity_id, kind, display_name, confidence, created_at, updated_at
      FROM memory_entities
      WHERE status = 'active'
      ORDER BY confidence DESC, updated_at DESC`,
   );
+};
 
-const queryMemoriesForEntity = (db: DatabaseSync, displayName: string, limit = 10): MemoryRow[] =>
+const queryMemoriesForEntity = (db: DatabaseSync, displayName: string, limit = 20): MemoryRow[] =>
   safeQueryAll<MemoryRow>(
     db,
     `SELECT memory_id, type, content, scope, confidence, value_score, tags, created_at, content_time
@@ -571,6 +593,18 @@ const queryMemoriesForEntity = (db: DatabaseSync, displayName: string, limit = 1
      LIMIT ?`,
     `%${displayName}%`,
     `%${displayName}%`,
+    limit,
+  );
+
+const queryEntityBeliefs = (db: DatabaseSync, entityId: string, limit = 20): EntityBeliefRow[] =>
+  safeQueryAll<EntityBeliefRow>(
+    db,
+    `SELECT belief_id, entity_id, type, content, status, confidence
+     FROM entity_beliefs
+     WHERE entity_id = ? AND status = 'current'
+     ORDER BY confidence DESC
+     LIMIT ?`,
+    entityId,
     limit,
   );
 
@@ -724,9 +758,10 @@ const renderMemoryIndexNote = (params: {
 const renderEntityPageNote = (params: {
   entity: EntityRow;
   memories: MemoryRow[];
+  beliefs: EntityBeliefRow[];
   generatedAt: string;
 }): string => {
-  const { entity, memories, generatedAt } = params;
+  const { entity, memories, beliefs, generatedAt } = params;
   const frontmatter = renderFrontmatter({
     entity_id: entity.entity_id,
     kind: entity.kind,
@@ -744,8 +779,19 @@ const renderEntityPageNote = (params: {
   lines.push(`- generated_at: ${generatedAt}`);
   lines.push("");
 
+  if (beliefs.length > 0) {
+    lines.push("## Beliefs");
+    lines.push("");
+    for (const b of beliefs) {
+      const snippet = b.content.replace(/\n/g, " ").substring(0, 200);
+      const typeTag = b.type ? ` [${b.type}]` : "";
+      lines.push(`- (conf: ${Number(b.confidence).toFixed(2)})${typeTag} ${snippet}`);
+    }
+    lines.push("");
+  }
+
   if (memories.length > 0) {
-    lines.push("## Known Facts");
+    lines.push("## Related Memories");
     lines.push("");
     for (const m of memories) {
       const when = m.content_time || m.created_at.slice(0, 10);
@@ -753,8 +799,10 @@ const renderEntityPageNote = (params: {
       lines.push(`- **${when}**${kindTag} ${m.content.replace(/\n/g, " ").substring(0, 200)}`);
     }
     lines.push("");
-  } else {
-    lines.push("*No specific memories found for this entity.*");
+  }
+
+  if (beliefs.length === 0 && memories.length === 0) {
+    lines.push("*No beliefs or memories found for this entity.*");
     lines.push("");
   }
 
@@ -1071,6 +1119,8 @@ export const renderVaultBuildMarkdown = ({
   lines.push(`- summaries: ${Number(summary?.summary_count || 0)}`);
   lines.push(`- condensed: ${Number(summary?.condensed_summary_count || 0)}`);
   lines.push(`- leaf: ${Number(summary?.leaf_summary_count || 0)}`);
+  lines.push(`- memories: ${Number(summary?.memory_count || 0)}`);
+  lines.push(`- entities: ${Number(summary?.entity_count || 0)}`);
   lines.push(`- copied_files: ${Number(summary?.copied_files || 0)}`);
   lines.push(`- skipped_unchanged: ${Number(summary?.skipped_unchanged || 0)}`);
   lines.push(`- removed_files: ${Number(summary?.removed_files || 0)}`);
@@ -1244,6 +1294,8 @@ export const buildVaultSurface = ({
     summary_count: 0,
     leaf_summary_count: 0,
     condensed_summary_count: 0,
+    memory_count: 0,
+    entity_count: 0,
     copied_files: 0,
     skipped_unchanged: 0,
     removed_files: 0,
@@ -1409,11 +1461,12 @@ export const buildVaultSurface = ({
     // Entity pages (one per entity)
     for (const entity of entities) {
       const entityMemories = queryMemoriesForEntity(ctx.db, entity.display_name);
+      const entityBeliefs = queryEntityBeliefs(ctx.db, entity.entity_id);
       const safeEntityName = entity.display_name.replace(/[/\\:*?"<>|]/g, "_");
       writeManagedText(
         writer,
         `60 Entities/${safeEntityName}.md`,
-        renderEntityPageNote({ entity, memories: entityMemories, generatedAt }),
+        renderEntityPageNote({ entity, memories: entityMemories, beliefs: entityBeliefs, generatedAt }),
       );
     }
 
@@ -1497,6 +1550,8 @@ export const buildVaultSurface = ({
       summary_count: allSummaries.length,
       leaf_summary_count: leafCount,
       condensed_summary_count: condensedCount,
+      memory_count: memoryNodes.length,
+      entity_count: entities.length,
       copied_files: writer.copied,
       skipped_unchanged: writer.skipped,
       removed_files: writer.removed,

@@ -140,6 +140,10 @@
     "falkordb.enabled": {
       "label": "FalkorDB Mirror",
       "help": "Enable the optional FalkorDB vector mirror and nearest-neighbor query path."
+    },
+    "vault.syncIntervalHours": {
+      "label": "Vault Sync Interval (hours)",
+      "help": "How often the vault mirror is automatically rebuilt, in hours. Set to 0 to disable automatic vault sync. Default: 24"
     }
   },
   "configSchema": {
@@ -373,7 +377,8 @@
           "distillationEnabled": { "type": "boolean", "default": false },
           "classificationIntervalSeconds": { "type": "integer", "minimum": 1, "default": 300 },
           "decayDays": { "type": "integer", "minimum": 1, "default": 90 },
-          "episodesPerBatch": { "type": "integer", "minimum": 1, "default": 20 }
+          "episodesPerBatch": { "type": "integer", "minimum": 1, "default": 20 },
+          "syncIntervalHours": { "type": "number", "minimum": 0, "default": 24 }
         }
       },
       "gradient": {

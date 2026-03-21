@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ensurePersonStore, rebuildEntityMentions } from "./person-service.js";
+import { isCommonEnglishWord, isLikelyEntityName, PERSON_MIN_CONFIDENCE, ORG_MIN_CONFIDENCE, PROJECT_MIN_CONFIDENCE } from "./entity-quality-filter.js";
 
 // ---------------------------------------------------------------------------
 // Inline helpers
@@ -286,6 +287,8 @@ const isLikelyPersonAlias = (value = ""): boolean => {
   if (PERSON_ALIAS_NOISE_TOKENS.has(normalized)) return false;
   if (!PERSONISH_ALIAS_RE.test(normalized)) return false;
   if (PLACEISH_ALIAS_RE.test(normalized)) return false;
+  // Comprehensive common-word filter for person names
+  if (!isLikelyEntityName(normalized)) return false;
   return true;
 };
 
@@ -1278,6 +1281,16 @@ const evaluateEntityCandidate = ({ entityKey = "", kind = "", aliases = [] as st
   const surfaceConfidenceThreshold = kind === "person" ? surfaceConfig.minConfidence : ["organization", "project"].includes(kind) ? Math.min(surfaceConfig.minConfidence, 0.65) : surfaceConfig.minConfidence;
   const highSurfaceConfidence = confidence >= surfaceConfidenceThreshold;
   const effectiveSurfaceConfidence = kind === "person" && strongName && (evidenceCount >= surfaceConfig.minEvidence || explicitlyTagged) ? confidence >= Math.min(surfaceConfidenceThreshold, 0.62) : highSurfaceConfidence;
+  // --- Minimum confidence thresholds (prevents low-confidence garbage) ---
+  if (kind === "person" && confidence < PERSON_MIN_CONFIDENCE && !explicitlyTagged && !hasCuratedEvidence) return { accepted: false, kind, aliases: filteredAliases, reason: "below_person_confidence_floor" };
+  if (kind === "organization" && confidence < ORG_MIN_CONFIDENCE && !explicitlyTyped && !hasCuratedEvidence) return { accepted: false, kind, aliases: filteredAliases, reason: "below_org_confidence_floor" };
+  if (kind === "project" && confidence < PROJECT_MIN_CONFIDENCE && !explicitlyTyped && !hasCuratedEvidence) return { accepted: false, kind, aliases: filteredAliases, reason: "below_project_confidence_floor" };
+
+  // --- Person name quality: reject single common English words as person names ---
+  // This is stricter for person entities because words like "boundaries",
+  // "features", "append" are never person names, but could be project names.
+  if (kind === "person" && !isLikelyEntityName(normalizedKey) && !explicitlyTagged) return { accepted: false, kind, aliases: filteredAliases, reason: "common_word_not_person" };
+
   if (kind === "person") {
     const enoughEvidence = explicitlyTagged && strongName ? evidenceCount >= 1 : evidenceCount >= Math.max(surfaceConfig.minEvidence, 2);
     if ((!strongName && !strongMention && !explicitlyTagged) || !isLikelyPersonAlias(entityKey) || (!enoughEvidence && !strongMention && !hasCuratedEvidence && !explicitlyTagged)) return { accepted: false, kind, aliases: filteredAliases, reason: "weak_person_evidence" };

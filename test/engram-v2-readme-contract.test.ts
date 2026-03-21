@@ -128,6 +128,7 @@ function makeConfig(databasePath: string): LcmConfig {
     vectorDimensions: 384,
     vectorEmbeddingModel: "text-embedding-3-small",
     vectorEmbeddingProvider: "openai",
+    vaultSyncIntervalHours: 24,
   };
 }
 

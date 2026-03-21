@@ -1,5 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 
+import { isCommonEnglishWord, isLikelyEntityName } from "./entity-quality-filter.js";
+
 // ---------------------------------------------------------------------------
 // Inline policy helpers (replaces policy.js imports)
 // ---------------------------------------------------------------------------
@@ -366,6 +368,9 @@ const isLikelyStandaloneNameCandidate = (
   if (PLACEISH_TOKEN_RE.test(original) || PLACEISH_TOKEN_RE.test(normalized)) return false;
   if (TECHISH_TOKEN_RE.test(normalized)) return false;
   if (!/^[a-zäöüß][a-zäöüß''.-]{2,47}$/i.test(original)) return false;
+  // Comprehensive common-word filter: reject any single token that is a
+  // common English word (the core fix for garbage entity extraction)
+  if (!isLikelyEntityName(normalized)) return false;
   return true;
 };
 
@@ -413,6 +418,8 @@ const isLikelyEntityToken = (value: unknown): boolean => {
   if (COMMON_NON_PERSON_TOKENS.has(token)) return false;
   if (QUERY_STOPWORDS.has(token)) return false;
   if (ENTITY_NOISE_STOPWORDS.has(token)) return false;
+  // Comprehensive common-word filter
+  if (!isLikelyEntityName(token)) return false;
   return true;
 };
 
@@ -452,7 +459,24 @@ export const scorePersonContent = ({
   if (keys.length === 0) {
     keys = splitNameCandidates(content);
   }
-  if (keys.length === 0) return null;
+
+  // Even without extractable entity keys, classify content that has strong
+  // person-role signals (relationship/public_profile cues) — this allows
+  // scoring unnamed-person content like "She is a TEDx speaker".
+  const role = classifyPersonRole(content);
+
+  if (keys.length === 0) {
+    // No entity keys found — only return a score if content has strong person cues
+    if (role === "relationship" || role === "public_profile") {
+      let score = 0.35;
+      if (role === "relationship") score += Number(config?.person?.relationshipPriorityBoost ?? 0.35);
+      if (role === "public_profile" && config?.person?.keepPublicFacts !== false) {
+        score += Number(config?.person?.publicProfileBoost ?? 0.1);
+      }
+      return { score: clamp01(score), role };
+    }
+    return null;
+  }
   let matched = false;
   for (const key of keys) {
     if (containsEntity(content, key, config?.person?.requireWordBoundaryMatch !== false)) {
@@ -462,7 +486,6 @@ export const scorePersonContent = ({
   }
   if (!matched) return null;
 
-  const role = classifyPersonRole(content);
   let score = 0.35;
   if (role === "relationship") score += Number(config?.person?.relationshipPriorityBoost ?? 0.35);
   if (role === "public_profile" && config?.person?.keepPublicFacts !== false) {

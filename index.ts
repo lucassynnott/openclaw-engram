@@ -70,6 +70,7 @@ import { createMemorySearchTool } from "./src/surface/memory-search-tool.js";
 import { createMemoryWorldTool } from "./src/surface/memory-world-tool.js";
 import { registerLcmHttpRoutes } from "./src/surface/http-routes.js";
 import { buildVaultSurface } from "./src/surface/vault-mirror.js";
+import { createVaultSyncService } from "./src/services/vault-sync-service.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1491,6 +1492,20 @@ const lcmPlugin = {
       config: deps.config,
       gatewayToken: gatewayToken || undefined,
     });
+
+    // Register periodic vault-sync service (rebuilds Obsidian vault surface)
+    const registerServiceFn = (
+      api as unknown as { registerService?: (service: unknown) => void }
+    ).registerService;
+    if (typeof registerServiceFn === "function") {
+      registerServiceFn(
+        createVaultSyncService({
+          config: deps.config,
+          logger: api.logger,
+        }),
+      );
+    }
+
     api.registerTool((ctx) =>
       createContextGrepTool({
         deps,
