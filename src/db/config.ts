@@ -82,6 +82,10 @@ export type LcmConfig = {
   episodeRetentionDays: number;
   heartbeatDedupeThreshold: number;
   fragmentMinContentChars: number;
+  harvestEnabled: boolean;
+  harvestEveryNTurns: number;
+  harvestLookbackTurns: number;
+  harvestModel: string;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -758,6 +762,34 @@ export function resolveLcmConfig(
       ["ENGRAM_FRAGMENT_MIN_CONTENT_CHARS"],
       ["hygiene.fragmentMinContentChars", "fragmentMinContentChars"],
       50,
+    ),
+    harvestEnabled: readBool(
+      env,
+      pc,
+      ["ENGRAM_HARVEST_ENABLED"],
+      ["periodicHarvest.enabled", "harvestEnabled"],
+      true,
+    ),
+    harvestEveryNTurns: readNumber(
+      env,
+      pc,
+      ["ENGRAM_HARVEST_EVERY_N_TURNS"],
+      ["periodicHarvest.everyNTurns", "harvestEveryNTurns"],
+      10,
+    ),
+    harvestLookbackTurns: readNumber(
+      env,
+      pc,
+      ["ENGRAM_HARVEST_LOOKBACK_TURNS"],
+      ["periodicHarvest.lookbackTurns", "harvestLookbackTurns"],
+      20,
+    ),
+    harvestModel: readString(
+      env,
+      pc,
+      ["ENGRAM_HARVEST_MODEL"],
+      ["periodicHarvest.model", "harvestModel"],
+      "",
     ),
   };
 }

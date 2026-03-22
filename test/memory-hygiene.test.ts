@@ -39,6 +39,10 @@ function makeConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     episodeRetentionDays: 7,
     heartbeatDedupeThreshold: 0.7,
     fragmentMinContentChars: 50,
+    harvestEnabled: true,
+    harvestEveryNTurns: 10,
+    harvestLookbackTurns: 20,
+    harvestModel: "",
     ...overrides,
   });
 }

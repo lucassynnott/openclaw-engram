@@ -144,6 +144,22 @@
     "vault.syncIntervalHours": {
       "label": "Vault Sync Interval (hours)",
       "help": "How often the vault mirror is automatically rebuilt, in hours. Set to 0 to disable automatic vault sync. Default: 24"
+    },
+    "periodicHarvest.enabled": {
+      "label": "Periodic Harvest",
+      "help": "Automatically extract durable memories from conversation every N turns. Non-blocking background extraction. Default: true"
+    },
+    "periodicHarvest.everyNTurns": {
+      "label": "Harvest Every N Turns",
+      "help": "Number of user turns between automatic memory extraction passes. Default: 10"
+    },
+    "periodicHarvest.lookbackTurns": {
+      "label": "Harvest Lookback",
+      "help": "Number of recent turns to send to the extraction model. Default: 20"
+    },
+    "periodicHarvest.model": {
+      "label": "Harvest Model",
+      "help": "Model override for memory extraction. Empty string inherits the session model. Use a fast/cheap model for cost efficiency."
     }
   },
   "configSchema": {
@@ -430,6 +446,16 @@
           "dimensions": { "type": "integer", "minimum": 1, "default": 1536 },
           "embeddingModel": { "type": "string", "default": "text-embedding-3-small" },
           "embeddingProvider": { "type": "string", "default": "openai" }
+        }
+      },
+      "periodicHarvest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "everyNTurns": { "type": "integer", "minimum": 1, "default": 10 },
+          "lookbackTurns": { "type": "integer", "minimum": 1, "default": 20 },
+          "model": { "type": "string", "default": "" }
         }
       }
     }

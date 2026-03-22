@@ -48,6 +48,13 @@ import {
 } from "../memory/store/conversation-store.js";
 import { SummaryStore } from "../memory/store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "../memory/summarize.js";
+import {
+  shouldHarvest,
+  runHarvest,
+  updateHarvestState,
+  countUserTurns,
+  ensureHarvestTable,
+} from "../memory/periodic-harvest.js";
 import type { LcmDependencies } from "../types.js";
 
 type AgentMessage = ContextEngineMessage;
@@ -1347,6 +1354,13 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
     }
+
+    // ── Periodic harvest (fire-and-forget) ──────────────────────────────
+    if (this.config.harvestEnabled && !params.isHeartbeat) {
+      void this.maybeRunHarvest(params.sessionId, params.messages).catch(() => {
+        // Harvest is fully best-effort — never fail the caller.
+      });
+    }
   }
 
   async assemble(params: {
@@ -1725,6 +1739,45 @@ export class LcmContextEngine implements ContextEngine {
       case "swept":
         removeDelegatedExpansionGrantForSession(childSessionKey);
         break;
+    }
+  }
+
+  // ── Periodic harvest ───────────────────────────────────────────────────
+
+  private async maybeRunHarvest(sessionId: string, messages: AgentMessage[]): Promise<void> {
+    try {
+      const db = getLcmConnection(this.config.databasePath);
+      ensureHarvestTable(db);
+
+      const userTurns = countUserTurns(messages);
+      if (!shouldHarvest(db, sessionId, userTurns, this.config.harvestEveryNTurns)) {
+        return;
+      }
+
+      this.deps.log.debug(`[harvest] Triggering harvest for session ${sessionId} at turn ${userTurns}`);
+
+      const result = await runHarvest({
+        db,
+        deps: {
+          config: this.config,
+          complete: this.deps.complete,
+          resolveModel: this.deps.resolveModel,
+          getApiKey: this.deps.getApiKey,
+          log: this.deps.log,
+        },
+        sessionId,
+        messages,
+      });
+
+      updateHarvestState(db, sessionId, userTurns);
+
+      if (result.stored > 0) {
+        this.deps.log.info(
+          `[harvest] Stored ${result.stored} memories from session ${sessionId}`,
+        );
+      }
+    } catch (err) {
+      this.deps.log.warn(`[harvest] Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
