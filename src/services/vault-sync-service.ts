@@ -14,6 +14,9 @@
  */
 
 import type { LcmConfig } from "../db/config.js";
+import { getLcmConnection } from "../db/connection.js";
+import { optimizeDatabase, archiveOldMemories } from "../db/optimize.js";
+import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { buildVaultSurface } from "../surface/vault-mirror.js";
 
 export type VaultSyncLogger = {
@@ -36,6 +39,32 @@ export type VaultSyncServiceOptions = {
 export function createVaultSyncService(options: VaultSyncServiceOptions) {
   const { config, logger } = options;
   let timer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Run lightweight database optimization (PRAGMA optimize + incremental
+   * vacuum + archive old candidates). All errors are caught and logged.
+   */
+  function runDbOptimize(): void {
+    if (!config.dbOptimizeEnabled) {
+      return;
+    }
+
+    try {
+      const db = getLcmConnection(config.databasePath);
+      ensureMemoryTables(db);
+
+      const result = optimizeDatabase(db);
+      const archived = archiveOldMemories(db);
+
+      logger.info(
+        `[engram:db-optimize] completed in ${result.durationMs}ms ` +
+          `(freedBytes=${result.freedBytes}, archivedMemories=${archived})`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`[engram:db-optimize] failed: ${message}`);
+    }
+  }
 
   /**
    * Run a single vault-sync cycle. All errors are caught and logged.
@@ -98,9 +127,11 @@ export function createVaultSyncService(options: VaultSyncServiceOptions) {
 
       // Run immediately on startup, then repeat on interval
       runVaultSync();
+      runDbOptimize();
 
       timer = setInterval(() => {
         runVaultSync();
+        runDbOptimize();
       }, intervalMs);
 
       // Allow the process to exit even if the timer is still active

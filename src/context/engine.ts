@@ -1750,7 +1750,7 @@ export class LcmContextEngine implements ContextEngine {
       ensureHarvestTable(db);
 
       const userTurns = countUserTurns(messages);
-      if (!shouldHarvest(db, sessionId, userTurns, this.config.harvestEveryNTurns)) {
+      if (!shouldHarvest(db, sessionId, userTurns, this.config.harvestEveryNTurns, this.config.harvestMinCooldownSeconds)) {
         return;
       }
 

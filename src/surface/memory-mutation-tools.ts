@@ -8,6 +8,7 @@ import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { upsertMemoryTrigger } from "../memory/memory-triggers.js";
 import { runMemoryHygiene } from "../memory/memory-hygiene.js";
 import { syncNativeMemoryLayer } from "../memory/native-file-sync.js";
+import { reindexMemoryVectorById } from "../memory/vector-search.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { storeMemory } from "./memory-add-tool.js";
@@ -297,6 +298,20 @@ export function createMemoryCorrectTool(input: {
         }
       }
 
+      // Re-embed the corrected memory so semantic search matches the new content.
+      // Best-effort: silently skips when vector backend is disabled ("none").
+      let vectorIndexWarning: string | null = null;
+      try {
+        await reindexMemoryVectorById({
+          db: getLcmConnection(input.config.databasePath),
+          config: input.config,
+          memoryId: String(corrected.memoryId),
+        });
+      } catch (err) {
+        vectorIndexWarning = err instanceof Error ? err.message : String(err);
+        console.warn("[memory_correct] vector re-index failed (non-fatal):", err);
+      }
+
       let nativeSyncRoot: string | null = null;
       try {
         nativeSyncRoot = syncNativeIfEnabled(input.config, input.resolveAgentDir);
@@ -316,6 +331,7 @@ export function createMemoryCorrectTool(input: {
         lines.push(`**Reason:** ${p.reason.trim()}`);
       }
       if (nativeSyncRoot) lines.push(`**Native sync:** ${nativeSyncRoot}`);
+      if (vectorIndexWarning) lines.push(`**Vector indexing warning:** ${vectorIndexWarning}`);
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],
@@ -324,6 +340,7 @@ export function createMemoryCorrectTool(input: {
           oldMemoryId: memoryId,
           newMemoryId: corrected.memoryId,
           nativeSyncRoot,
+          vectorIndexWarning,
         },
       };
       } catch (err) {

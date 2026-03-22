@@ -160,6 +160,10 @@
     "periodicHarvest.model": {
       "label": "Harvest Model",
       "help": "Model override for memory extraction. Empty string inherits the session model. Use a fast/cheap model for cost efficiency."
+    },
+    "periodicHarvest.minCooldownSeconds": {
+      "label": "Harvest Min Cooldown (seconds)",
+      "help": "Minimum time between harvest runs in seconds, regardless of turn count. Prevents excessive LLM calls when everyNTurns is very low. Default: 60"
     }
   },
   "configSchema": {
@@ -455,7 +459,8 @@
           "enabled": { "type": "boolean", "default": true },
           "everyNTurns": { "type": "integer", "minimum": 1, "default": 10 },
           "lookbackTurns": { "type": "integer", "minimum": 1, "default": 20 },
-          "model": { "type": "string", "default": "" }
+          "model": { "type": "string", "default": "" },
+          "minCooldownSeconds": { "type": "integer", "minimum": 0, "default": 60 }
         }
       }
     }

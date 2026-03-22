@@ -86,6 +86,8 @@ export type LcmConfig = {
   harvestEveryNTurns: number;
   harvestLookbackTurns: number;
   harvestModel: string;
+  harvestMinCooldownSeconds: number;
+  dbOptimizeEnabled: boolean;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -790,6 +792,20 @@ export function resolveLcmConfig(
       ["ENGRAM_HARVEST_MODEL"],
       ["periodicHarvest.model", "harvestModel"],
       "",
+    ),
+    harvestMinCooldownSeconds: readNumber(
+      env,
+      pc,
+      ["ENGRAM_HARVEST_MIN_COOLDOWN_SECONDS"],
+      ["periodicHarvest.minCooldownSeconds", "harvestMinCooldownSeconds"],
+      60,
+    ),
+    dbOptimizeEnabled: readBool(
+      env,
+      pc,
+      ["ENGRAM_DB_OPTIMIZE_ENABLED"],
+      ["dbOptimizeEnabled"],
+      true,
     ),
   };
 }

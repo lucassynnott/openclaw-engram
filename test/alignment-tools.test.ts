@@ -97,6 +97,8 @@ function makeConfig(databasePath: string): LcmConfig {
     harvestEveryNTurns: 10,
     harvestLookbackTurns: 20,
     harvestModel: "",
+    harvestMinCooldownSeconds: 60,
+    dbOptimizeEnabled: true,
   };
 }
 

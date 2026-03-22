@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveLcmConfig } from "./src/db/config.js";
 import { getLcmConnection } from "./src/db/connection.js";
+import { validateConfig } from "./src/db/validate-config.js";
 import { LcmContextEngine } from "./src/context/engine.js";
 import {
   registerContextEngine,
@@ -1469,6 +1470,7 @@ const lcmPlugin = {
 
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
+    validateConfig(deps.config, deps.log);
     void clearVectorRuntime(deps.config.databasePath);
     const vectorRuntime = buildVectorRuntime(api, deps);
     if (vectorRuntime) {

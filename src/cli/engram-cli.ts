@@ -2,12 +2,14 @@
 /**
  * Engram CLI - Command-line interface for Engram memory management
  */
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolveLcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { buildVaultSurface } from "../surface/vault-mirror.js";
 import { createOpsStatusTool } from "../surface/engram-v2-compat-tools.js";
 import { parseMigrateArgs, runEngramMigration } from "./migrate.js";
+import { exportMemories, importMemories } from "./export-import.js";
 
 const command = process.argv[2];
 
@@ -22,6 +24,8 @@ Commands:
   db-stats         Show database table counts
   vault-sync       Force a vault mirror rebuild
   migrate          Migrate Engram database from v1 to v2
+  export           Export memories and entities to a JSON file
+  import <path>    Import memories from a JSON export
 
 Run 'engram <command> --help' for more information on a command.
 `);
@@ -113,6 +117,54 @@ switch (command) {
         result.errors.forEach((e) => console.error(`  ✗ ${e}`));
         process.exit(1);
       }
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+    break;
+  }
+
+  case "export": {
+    try {
+      const config = resolveLcmConfig(process.env, {});
+      const db = getLcmConnection(config.databasePath);
+      ensureMemoryTables(db);
+      const outputIdx = process.argv.indexOf("--output");
+      const outputPath =
+        outputIdx !== -1 && process.argv[outputIdx + 1]
+          ? process.argv[outputIdx + 1]
+          : "engram-export.json";
+      const data = exportMemories(db);
+      writeFileSync(outputPath, JSON.stringify(data, null, 2), "utf-8");
+      console.log(
+        `Exported ${data.memories.length} memories, ${data.entities.length} entities to ${outputPath}`,
+      );
+      process.exit(0);
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+    break;
+  }
+
+  case "import": {
+    try {
+      const importPath = process.argv[3];
+      if (!importPath) {
+        console.error("Usage: engram import <path>");
+        process.exit(1);
+      }
+      const config = resolveLcmConfig(process.env, {});
+      const db = getLcmConnection(config.databasePath);
+      ensureMemoryTables(db);
+      const raw = readFileSync(importPath, "utf-8");
+      const data = JSON.parse(raw) as ReturnType<typeof exportMemories>;
+      const result = importMemories(db, data);
+      console.log(
+        `Imported ${result.memoriesImported} memories (${result.memoriesSkipped} duplicates skipped), ` +
+        `${result.entitiesImported} entities (${result.entitiesSkipped} duplicates skipped)`,
+      );
+      process.exit(0);
     } catch (err) {
       console.error(`Error: ${err}`);
       process.exit(1);
