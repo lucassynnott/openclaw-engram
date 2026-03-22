@@ -101,6 +101,8 @@ export type StoreMemoryParams = {
   sourceLine?: number | null;
   contentTime?: string | null;
   dedupeMode?: "none" | "global" | "session";
+  /** Memory IDs to exclude from dedup checks (e.g. the memory being corrected). */
+  excludeMemoryIds?: string[];
   skipArchiveCandidates?: boolean;
 };
 
@@ -154,38 +156,51 @@ function findDuplicateMemoryId(params: {
   kind: MemoryKind;
   sourceSession?: string;
   dedupeMode: "none" | "global" | "session";
+  excludeMemoryIds?: string[];
 }): string | undefined {
   if (!params.normalizedHash || params.dedupeMode === "none") {
     return undefined;
   }
 
   const db = getLcmConnection(params.config.databasePath);
+  const excludeSet = new Set(params.excludeMemoryIds ?? []);
+
   if (params.dedupeMode === "session" && params.sourceSession) {
-    const row = db
+    const rows = db
       .prepare(`
         SELECT memory_id
         FROM memory_current
         WHERE normalized_hash = ? AND scope = ? AND type = ? AND COALESCE(source_session, '') = ?
-        LIMIT 1
+        LIMIT 10
       `)
-      .get(
+      .all(
         params.normalizedHash,
         params.scope,
         params.kind,
         params.sourceSession,
-      ) as { memory_id?: string } | undefined;
-    return typeof row?.memory_id === "string" ? row.memory_id : undefined;
+      ) as Array<{ memory_id?: string }>;
+    for (const row of rows) {
+      if (typeof row.memory_id === "string" && !excludeSet.has(row.memory_id)) {
+        return row.memory_id;
+      }
+    }
+    return undefined;
   }
 
-  const row = db
+  const rows = db
     .prepare(`
       SELECT memory_id
       FROM memory_current
       WHERE normalized_hash = ? AND scope = ? AND type = ?
-      LIMIT 1
+      LIMIT 10
     `)
-    .get(params.normalizedHash, params.scope, params.kind) as { memory_id?: string } | undefined;
-  return typeof row?.memory_id === "string" ? row.memory_id : undefined;
+    .all(params.normalizedHash, params.scope, params.kind) as Array<{ memory_id?: string }>;
+  for (const row of rows) {
+    if (typeof row.memory_id === "string" && !excludeSet.has(row.memory_id)) {
+      return row.memory_id;
+    }
+  }
+  return undefined;
 }
 
 function tokenizeNormalized(text: string): string[] {
@@ -223,6 +238,7 @@ function findSemanticDuplicate(params: {
   sourceSession?: string;
   dedupeMode: "none" | "global" | "session";
   threshold?: number;
+  excludeMemoryIds?: string[];
 }): { memoryId: string; similarity: number } | undefined {
   if (params.dedupeMode === "none") {
     return undefined;
@@ -231,6 +247,8 @@ function findSemanticDuplicate(params: {
   const effectiveThreshold = typeof params.threshold === "number" && Number.isFinite(params.threshold)
     ? params.threshold
     : SEMANTIC_DEDUPE_THRESHOLD;
+
+  const excludeSet = new Set(params.excludeMemoryIds ?? []);
 
   const where = ["status = 'active'", "scope = ?", "type = ?"];
   const queryParams: Array<string | number> = [params.scope, params.kind];
@@ -254,13 +272,17 @@ function findSemanticDuplicate(params: {
 
   let best: { memoryId: string; similarity: number } | undefined;
   for (const row of rows) {
+    const memId = String(row.memory_id || "");
+    if (excludeSet.has(memId)) {
+      continue;
+    }
     const similarity = overlapSimilarity(params.content, String(row.content || ""));
     if (similarity < effectiveThreshold) {
       continue;
     }
     if (!best || similarity > best.similarity) {
       best = {
-        memoryId: String(row.memory_id || ""),
+        memoryId: memId,
         similarity,
       };
     }
@@ -404,6 +426,7 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
     kind: effectiveKind,
     sourceSession: params.sourceSession,
     dedupeMode: params.dedupeMode ?? "global",
+    excludeMemoryIds: params.excludeMemoryIds,
   });
   if (duplicateOf) {
     return {
@@ -429,6 +452,7 @@ export function storeMemory(params: StoreMemoryParams): StoreMemoryResult {
     sourceSession: params.sourceSession,
     dedupeMode: params.dedupeMode ?? "global",
     threshold: heartbeatThreshold,
+    excludeMemoryIds: params.excludeMemoryIds,
   });
   if (semanticDuplicate) {
     return {

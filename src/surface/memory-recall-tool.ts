@@ -77,45 +77,91 @@ export function createMemoryRecallTool(input: { config: LcmConfig }): AnyAgentTo
       }
       ensureMemoryTables(db);
 
-      const where: string[] = ["status = 'active'", "confidence >= ?"];
-      const queryParams: (string | number | null)[] = [minConfidence];
+      const baseWhere: string[] = ["status = 'active'", "confidence >= ?"];
+      const baseParams: (string | number | null)[] = [minConfidence];
 
       if (scope) {
-        where.push("scope = ?");
-        queryParams.push(scope);
+        baseWhere.push("scope = ?");
+        baseParams.push(scope);
       }
 
       const kinds = Array.isArray(p.kinds)
         ? (p.kinds as unknown[]).filter((k): k is string => typeof k === "string").map((k) => k.toUpperCase())
         : [];
       if (kinds.length > 0) {
-        where.push(`type IN (${kinds.map(() => "?").join(",")})`);
-        queryParams.push(...kinds);
+        baseWhere.push(`type IN (${kinds.map(() => "?").join(",")})`);
+        baseParams.push(...kinds);
       }
 
-      const sql = `
-        SELECT memory_id, type, content, scope, confidence, value_score, tags, created_at
-        FROM memory_current
-        WHERE ${where.join(" AND ")}
-        ORDER BY
-          CASE type
-            WHEN 'USER_FACT' THEN 1
-            WHEN 'PREFERENCE' THEN 2
-            WHEN 'AGENT_IDENTITY' THEN 3
-            WHEN 'DECISION' THEN 4
-            WHEN 'ENTITY' THEN 5
-            WHEN 'EPISODE' THEN 6
-            ELSE 7
-          END ASC,
-          confidence DESC,
-          created_at DESC
-        LIMIT ?
-      `;
-      queryParams.push(topK);
+      // Per-type budget allocation: guarantee type diversity in recall results.
+      // High-signal types get reserved slots, then remaining slots fill by confidence.
+      const TYPE_PRIORITY: Array<{ type: string; reservedSlots: number }> = [
+        { type: "PREFERENCE", reservedSlots: 2 },
+        { type: "DECISION", reservedSlots: 2 },
+        { type: "AGENT_IDENTITY", reservedSlots: 1 },
+      ];
+      const MAX_PER_TYPE = Math.max(3, Math.ceil(topK * 0.4));
 
       let rows: Array<Record<string, unknown>>;
       try {
-        rows = db.prepare(sql).all(...queryParams) as Array<Record<string, unknown>>;
+        const collected: Array<Record<string, unknown>> = [];
+        const seenIds = new Set<string>();
+
+        // Phase 1: fill reserved slots from high-signal types
+        for (const { type, reservedSlots } of TYPE_PRIORITY) {
+          if (kinds.length > 0 && !kinds.includes(type)) continue;
+          const typeWhere = [...baseWhere, "type = ?"];
+          const typeParams = [...baseParams, type, reservedSlots];
+          const typeSql = `
+            SELECT memory_id, type, content, scope, confidence, value_score, tags, created_at
+            FROM memory_current
+            WHERE ${typeWhere.join(" AND ")}
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT ?
+          `;
+          const typeRows = db.prepare(typeSql).all(...typeParams) as Array<Record<string, unknown>>;
+          for (const r of typeRows) {
+            const id = String(r.memory_id);
+            if (!seenIds.has(id)) {
+              seenIds.add(id);
+              collected.push(r);
+            }
+          }
+        }
+
+        // Phase 2: fill remaining slots with best-by-confidence across all types
+        const remaining = topK - collected.length;
+        if (remaining > 0) {
+          const fillSql = `
+            SELECT memory_id, type, content, scope, confidence, value_score, tags, created_at
+            FROM memory_current
+            WHERE ${baseWhere.join(" AND ")}
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT ?
+          `;
+          const fillParams = [...baseParams, topK * 3]; // over-fetch to skip already-collected
+          const fillRows = db.prepare(fillSql).all(...fillParams) as Array<Record<string, unknown>>;
+
+          // Track per-type counts (including phase 1) to enforce MAX_PER_TYPE
+          const typeCounts: Record<string, number> = {};
+          for (const r of collected) {
+            const t = String(r.type);
+            typeCounts[t] = (typeCounts[t] ?? 0) + 1;
+          }
+
+          for (const r of fillRows) {
+            if (collected.length >= topK) break;
+            const id = String(r.memory_id);
+            if (seenIds.has(id)) continue;
+            const t = String(r.type);
+            if ((typeCounts[t] ?? 0) >= MAX_PER_TYPE) continue;
+            seenIds.add(id);
+            typeCounts[t] = (typeCounts[t] ?? 0) + 1;
+            collected.push(r);
+          }
+        }
+
+        rows = collected;
       } catch (err) {
         console.error("[memory_recall] query failed:", err);
         return jsonResult({

@@ -250,7 +250,8 @@ export function createMemoryCorrectTool(input: {
           corrected_memory_id: memoryId,
           reason: typeof p.reason === "string" ? p.reason.trim() || undefined : undefined,
         },
-        dedupeMode: "none",
+        dedupeMode: "global",
+        excludeMemoryIds: [memoryId],
       });
 
       if (!corrected.stored || !corrected.memoryId) {
