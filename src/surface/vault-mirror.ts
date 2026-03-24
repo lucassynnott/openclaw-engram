@@ -1420,7 +1420,7 @@ export const buildVaultSurface = ({
     // Session notes — only write if the conversation has at least one summary
     for (const conv of conversations) {
       const convSummaries = summariesByConversation.get(conv.conversation_id) ?? [];
-      if (convSummaries.length === 0) continue; // skip empty stubs
+      if (convSummaries.filter((s) => s.kind === "condensed").length === 0) continue; // skip stubs with no condensed summaries
       const agentId = parseAgentId(conv.session_id);
       writeManagedText(
         writer,
