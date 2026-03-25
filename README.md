@@ -16,6 +16,7 @@ One install, one config, one database. The default database path remains `~/.ope
 
 ## Table of contents
 
+- [Recent updates](#recent-updates)
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
@@ -26,6 +27,15 @@ One install, one config, one database. The default database path remains `~/.ope
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
+
+## Recent updates
+
+- **Activation-based memory lifecycle** — Engram now separates `truth_confidence` from `activation_strength`. Duplicate captures reinforce existing memories instead of only failing, and explicit recall/search/query surfaces reinforce only the memories actually returned.
+- **First-class observations** — `OBSERVATION` is now a real durable memory kind alongside facts, preferences, decisions, entities, and episodes.
+- **No archive-on-write for ordinary low-value memories** — low-value memories stay stored as active rows by default and rank low instead of disappearing immediately. If a caller wants strict rejection, `skipArchiveCandidates` still blocks them before insert.
+- **Opt-in cold tiering** — ordinary memories are no longer forgotten just because they got old. Heartbeat/status spam still gets archived, and low-activation episode tiering is available behind rollout flags.
+- **Lifecycle-aware native sync and ops** — `items.yaml` now round-trips lifecycle metadata, and `ops_status` reports activation rollout, reinforcement counters, duplicate-to-reinforce ratio, and cold-tier episode counts.
+- **Vault session-note fix** — vault sync no longer emits empty session notes for conversations that have no summaries.
 
 ## What it does
 
@@ -38,8 +48,9 @@ When a conversation grows beyond the model's context window, OpenClaw normally t
 5. **Provides tools** so agents can search and recall details from compacted history
 6. **Extracts durable facts** right before compaction — decisions, preferences, entities, episodes — so they survive summarization intact
 7. **Harvests memories** automatically every N turns by running a background LLM extraction pass over recent conversation
-8. **Ranks recall** by memory type — preferences and decisions surface above ephemeral facts
-9. **Mirrors to Obsidian** with an auto-rebuilding vault surface (entity pages, memory index, knowledge graph views)
+8. **Tracks reinforcement** so repeated capture and successful retrieval keep important memories easy to surface
+9. **Ranks recall** by truth, activation, lexical/vector match, and memory type — preferences and decisions surface above stale noise
+10. **Mirrors to Obsidian** with an auto-rebuilding vault surface (entity pages, memory index, knowledge graph views)
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
@@ -56,6 +67,20 @@ This is the critical difference from a simple summarization approach: durable fa
 Every N user turns (default: 10), Engram runs a background LLM extraction pass over recent conversation to capture preferences, corrections, decisions, and facts the user reveals naturally. This is non-blocking — it fires after the assistant response and never delays the main reply.
 
 Extracted memories are stored through the standard pipeline with full deduplication, quality filtering, and entity linking. Only PREFERENCE, DECISION, and USER_FACT kinds are extracted (never EPISODE or CONTEXT).
+
+### Activation-based lifecycle
+
+Engram now models durable memory with two separate axes:
+
+- **Truth confidence** — how likely the memory is correct
+- **Activation strength** — how retrievable the memory is right now
+
+That split fixes an old design problem where age, confidence, and usefulness were all being mixed together.
+
+- Duplicate captures reinforce the existing row instead of creating junk or hard-failing.
+- `memory_search`, `memory_recall`, `memory_query`, and proactive surfacing reinforce only the memories actually returned to the caller.
+- Old memories decay in visibility instead of being deleted by age.
+- `memory_correct` and `memory_retract` explicitly change truth-state instead of only changing ranking.
 
 ## Quick start
 
@@ -180,6 +205,8 @@ Add an `engram` entry under `plugins.entries` in your OpenClaw config:
 | `ENGRAM_VECTOR_BACKEND` | `sqlite_vec` | Vector backend: `sqlite_vec`, `falkordb`, or `none` |
 | `ENGRAM_VECTOR_EMBEDDING_PROVIDER` | `openai` | Embedding provider for vector indexing |
 | `ENGRAM_VECTOR_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model for vector indexing |
+| `ENGRAM_ACTIVATION_MODEL_ENABLED` | `false` | Enable the activation-based lifecycle model (truth + activation + reinforcement) |
+| `ENGRAM_ACTIVATION_MODEL_ROLLOUT_FRACTION` | `0` | Roll out activation behavior by deterministic fraction from `0.0` to `1.0` |
 | `ENGRAM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles |
 
 #### Periodic harvest
@@ -196,9 +223,11 @@ Add an `engram` entry under `plugins.entries` in your OpenClaw config:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENGRAM_EPISODE_RETENTION_DAYS` | `7` | Auto-archive EPISODE entries older than this |
+| `ENGRAM_EPISODE_RETENTION_DAYS` | `7` | Legacy retention knob now used for heartbeat/status-spam EPISODE archival windows |
 | `ENGRAM_HEARTBEAT_DEDUPE_THRESHOLD` | `0.7` | Lower similarity threshold for heartbeat dedup |
 | `ENGRAM_FRAGMENT_MIN_CONTENT_CHARS` | `50` | Minimum chars for non-fragment memories |
+| `ENGRAM_HYGIENE_TIERING_ENABLED` | `false` | Enable opt-in cold-tier episode hygiene |
+| `ENGRAM_HYGIENE_TIERING_MODE` | `observe` | Cold-tier mode: `observe` or `enforce` |
 | `ENGRAM_DB_OPTIMIZE_ENABLED` | `true` | Run periodic DB optimization (PRAGMA optimize + incremental vacuum) |
 
 #### Vault and Obsidian
@@ -246,18 +275,18 @@ Once installed, your agents automatically have access to:
 
 | Tool | What it does |
 |------|-------------|
-| `memory_search` | Keyword and semantic search across stored memories. Type-weighted ranking boosts PREFERENCE (1.3x) and DECISION (1.2x) above noise. |
-| `memory_add` | Store durable facts, decisions, preferences, and entities. Full quality filtering rejects system prompts, credentials, and injection artifacts. |
+| `memory_search` | Keyword and semantic search across stored memories. Returned hits reinforce activation when the rollout is enabled. |
+| `memory_add` | Store durable facts, observations, decisions, preferences, and entities. Duplicate captures reinforce existing rows instead of only failing. |
 | `memory_get` | Fetch a specific memory, episode, summary, file, or entity by ID |
-| `memory_recall` | Load top-k memories by confidence with per-type budget allocation. Guarantees type diversity (PREFERENCE, DECISION, AGENT_IDENTITY get reserved slots). |
-| `memory_query` | Strategy-aware recall for timelines, entity briefs, and targeted questions |
-| `memory_retract` | Mark a memory as wrong/superseded so it stops surfacing |
-| `memory_correct` | Replace an existing memory with a corrected version (triggers vector re-embedding) |
+| `memory_recall` | Load top-k memories by composite recall score with per-type budget allocation. Returned rows reinforce activation when enabled. |
+| `memory_query` | Strategy-aware recall for timelines, entity briefs, and targeted questions. Only surfaced rows are reinforced. |
+| `memory_retract` | Mark a memory as wrong/superseded and explicitly demote its truth/activation state |
+| `memory_correct` | Replace an existing memory with a corrected version and strongly seed the replacement lifecycle |
 | `memory_world` | Surface the entity model — people, projects, organizations |
 | `entity_get` | Fetch a rich entity profile with beliefs, episodes, and syntheses |
 | `entity_merge` | Merge duplicate entities into a canonical entity |
 | `vault_query` | Query the Obsidian vault mirror by category and text |
-| `ops_status` | Engram health dashboard across memory, LCM, vault, and alignment |
+| `ops_status` | Engram health dashboard across memory, LCM, vault, alignment, activation rollout, and cold-tier observability |
 
 ### Context tools (conversation history)
 
@@ -290,21 +319,24 @@ Engram includes multiple layers of memory quality control to keep the store clea
 
 ### Memory hygiene (automatic)
 
-- **Episode retention** — EPISODE entries older than 7 days are auto-archived
+- **No blanket age-pruning** — ordinary memories are not deleted or archived just because they got old
 - **Heartbeat archival** — heartbeat-pattern episodes are identified and archived
+- **Cold-tier episode hygiene** — low-value, unreviewed, inactive episodes can be observed or archived when tiering is enabled
 - **Fragment cleanup** — entries under 50 chars with no meaningful content are archived
 - **Heartbeat dedup** — lower similarity threshold (0.7 vs 0.8) catches near-duplicate status logs
+- **Low-value storage stays recallable** — low-value memories remain stored and can resurface through targeted search
 - **DB optimization** — `PRAGMA optimize` + incremental vacuum runs every 24 hours
 
 ### Search ranking
 
-Type-based score multipliers ensure high-signal memories surface above noise:
+Recall scoring blends truth confidence, activation, value, lexical/vector match, temporal fit, and entity locks. Type-based score multipliers still bias high-signal memories above noise:
 
 | Type | Multiplier |
 |------|-----------|
 | PREFERENCE | 1.3x |
 | DECISION | 1.2x |
 | USER_FACT | 1.0x |
+| OBSERVATION | 1.0x |
 | AGENT_IDENTITY | 1.0x |
 | ENTITY | 0.9x |
 | CONTEXT | 0.8x |
@@ -363,6 +395,10 @@ Export format:
       "type": "PREFERENCE",
       "content": "User prefers TypeScript over JavaScript",
       "confidence": 0.85,
+      "truth_confidence": 0.85,
+      "activation_strength": 0.63,
+      "reinforcement_count": 4,
+      "retrieval_count": 7,
       "value_label": "core",
       ...
     }
@@ -378,7 +414,7 @@ Export format:
 }
 ```
 
-Import deduplicates by `normalized_hash` for memories and `entity_id` for entities. Importing the same file twice is safe.
+Import deduplicates by `normalized_hash` for memories and `entity_id` for entities. Importing the same file twice is safe. Native PARA sync also round-trips lifecycle metadata through managed `items.yaml` files.
 
 ## Documentation
 
@@ -433,10 +469,12 @@ src/
     retrieval.ts                # RetrievalEngine — grep, describe, expand operations
     capture.ts                  # Pre-compaction memory extraction from messages
     periodic-harvest.ts         # Background LLM memory extraction every N turns
+    activation.ts               # Activation decay and reinforcement math
+    activation-rollout.ts       # Deterministic rollout helpers for activation + hygiene tiering
     memory-utils.ts             # Junk detection, value classification, content scoring
-    memory-hygiene.ts           # Episode archival, heartbeat cleanup, fragment removal
-    memory-schema.ts            # SQLite table definitions
-    native-file-sync.ts         # Bidirectional sync with MEMORY.md and daily notes
+    memory-hygiene.ts           # Heartbeat cleanup, fragment removal, opt-in cold-tier episode hygiene
+    memory-schema.ts            # SQLite table definitions + lifecycle backfill
+    native-file-sync.ts         # Bidirectional sync with MEMORY.md/daily notes + lifecycle round-trip
     vector-search.ts            # Vector similarity search and embedding management
     store/
       conversation-store.ts     # Message persistence and retrieval
@@ -446,14 +484,14 @@ src/
     person-service.ts           # Person entity extraction with multi-word name patterns
     world-model.ts              # Entity candidate evaluation and world model management
   surface/
-    memory-add-tool.ts          # memory_add tool with quality filtering and entity linking
-    memory-search-tool.ts       # memory_search with type-weighted ranking
-    memory-recall-tool.ts       # memory_recall with per-type budget allocation
-    memory-recall-core.ts       # Composite scoring engine (confidence, vector, type multipliers)
-    memory-mutation-tools.ts    # memory_retract and memory_correct with vector re-embedding
-    memory-query-tool.ts        # memory_query strategy-aware recall
+    memory-add-tool.ts          # memory_add with quality filtering, lifecycle seeding, and duplicate reinforcement
+    memory-search-tool.ts       # memory_search with returned-result reinforcement
+    memory-recall-tool.ts       # memory_recall with per-type budgeting and reinforcement
+    memory-recall-core.ts       # Composite scoring engine (truth, activation, vector, lexical, type)
+    memory-mutation-tools.ts    # memory_retract and memory_correct with truth/activation invalidation
+    memory-query-tool.ts        # memory_query strategy-aware recall with returned-result reinforcement
     memory-world-tool.ts        # memory_world entity surface
-    engram-v2-compat-tools.ts   # ops_status, vault_query, entity tools
+    engram-v2-compat-tools.ts   # ops_status, activation observability, vault_query, entity tools
     alignment-tools.ts          # Alignment check, drift, and status tools
     vault-mirror.ts             # Obsidian vault build engine
     lcm-grep-tool.ts            # context_grep implementation
