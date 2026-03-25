@@ -17,6 +17,8 @@ function makeConfig(): LcmConfig {
     vaultEnabled: false,
     nativeEnabled: false,
     gradientEnabled: true,
+    activationModelEnabled: true,
+    activationModelRolloutFraction: 1,
   });
 }
 
@@ -38,7 +40,7 @@ describe("memory mutation and proactive context", () => {
     closeLcmConnection(TEST_DB_PATH);
   });
 
-  it("suppresses near-duplicate memory_add writes", async () => {
+  it("reinforces near-duplicate memory_add writes against the existing row", async () => {
     const tool = createMemoryAddTool({
       config,
       deps: makeDeps(),
@@ -55,8 +57,21 @@ describe("memory mutation and proactive context", () => {
     });
 
     expect(first.details.stored).toBe(true);
-    expect(second.details.stored).toBe(false);
-    expect(second.details.reason).toBe("duplicate_semantic");
+    expect(second.details.stored).toBe(true);
+    expect(second.details.reinforced).toBe(true);
+    expect(second.details.memoryId).toBe(first.details.memoryId);
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const row = db
+      .prepare(`
+        SELECT COUNT(*) AS c, MAX(reinforcement_count) AS reinforcement_count
+        FROM memory_current
+        WHERE type = 'DECISION'
+          AND (content LIKE ? OR content LIKE ?)
+      `)
+      .get("%vault sync fix%", "%OpenClaw gateway cleanly%") as Record<string, unknown>;
+    expect(Number(row.c)).toBe(1);
+    expect(Number(row.reinforcement_count)).toBeGreaterThan(1);
   });
 
   it("registers proactive trigger patterns via memory_add", async () => {
@@ -83,13 +98,8 @@ describe("memory mutation and proactive context", () => {
     expect(triggerRow?.pattern).toBe("vault sync");
   });
 
-  it("corrects and retracts memories with supersession links", async () => {
+  it("retracts memories by demoting truth and activation metadata", async () => {
     const addTool = createMemoryAddTool({
-      config,
-      deps: makeDeps(),
-      sessionKey: "agent:main:main",
-    });
-    const correctTool = createMemoryCorrectTool({
       config,
       deps: makeDeps(),
       sessionKey: "agent:main:main",
@@ -105,30 +115,89 @@ describe("memory mutation and proactive context", () => {
       kind: "PREFERENCE",
       entities: ["Lucas"],
     });
-    const corrected = await correctTool.execute("t5", {
+    const retracted = await retractTool.execute("t5", {
+      memoryId: addResult.details.memoryId,
+      reason: "Temporary experiment only",
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const row = db
+      .prepare(`
+        SELECT status, confidence, truth_confidence, activation_strength, activation_seed,
+               last_reviewed_at, archived_at
+        FROM memory_current
+        WHERE memory_id = ?
+      `)
+      .get(addResult.details.memoryId) as Record<string, unknown> | undefined;
+
+    expect(retracted.details.retracted).toBe(true);
+    expect(row?.status).toBe("superseded");
+    expect(Number(row?.confidence)).toBeLessThan(0.2);
+    expect(Number(row?.truth_confidence)).toBeLessThan(0.2);
+    expect(Number(row?.activation_strength)).toBeLessThan(0.2);
+    expect(row?.activation_seed).toBe("retraction");
+    expect(String(row?.last_reviewed_at || "")).not.toBe("");
+    expect(String(row?.archived_at || "")).not.toBe("");
+  });
+
+  it("corrects memories with a strongly-seeded replacement and invalidates the source row", async () => {
+    const addTool = createMemoryAddTool({
+      config,
+      deps: makeDeps(),
+      sessionKey: "agent:main:main",
+    });
+    const correctTool = createMemoryCorrectTool({
+      config,
+      deps: makeDeps(),
+      sessionKey: "agent:main:main",
+    });
+
+    const addResult = await addTool.execute("t6", {
+      content: "Lucas prefers Vim.",
+      kind: "PREFERENCE",
+      entities: ["Lucas"],
+    });
+    const corrected = await correctTool.execute("t7", {
       memoryId: addResult.details.memoryId,
       content: "Lucas prefers Neovim.",
       kind: "PREFERENCE",
       reason: "Updated preference",
     });
-    const retracted = await retractTool.execute("t6", {
-      memoryId: corrected.details.newMemoryId,
-      reason: "Temporary experiment only",
-    });
 
     const db = getLcmConnection(TEST_DB_PATH);
     const original = db
-      .prepare("SELECT status, superseded_by FROM memory_current WHERE memory_id = ?")
+      .prepare(`
+        SELECT status, superseded_by, confidence, truth_confidence, activation_strength, activation_seed,
+               last_reviewed_at, archived_at
+        FROM memory_current
+        WHERE memory_id = ?
+      `)
       .get(addResult.details.memoryId) as Record<string, unknown> | undefined;
     const replacement = db
-      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .prepare(`
+        SELECT status, confidence, truth_confidence, activation_strength, activation_seed,
+               last_reviewed_at, archived_at
+        FROM memory_current
+        WHERE memory_id = ?
+      `)
       .get(corrected.details.newMemoryId) as Record<string, unknown> | undefined;
 
     expect(corrected.details.corrected).toBe(true);
     expect(original?.status).toBe("superseded");
     expect(original?.superseded_by).toBe(corrected.details.newMemoryId);
-    expect(retracted.details.retracted).toBe(true);
-    expect(replacement?.status).toBe("superseded");
+    expect(Number(original?.confidence)).toBeLessThan(0.2);
+    expect(Number(original?.truth_confidence)).toBeLessThan(0.2);
+    expect(Number(original?.activation_strength)).toBeLessThan(0.2);
+    expect(original?.activation_seed).toBe("correction_superseded");
+    expect(String(original?.last_reviewed_at || "")).not.toBe("");
+    expect(String(original?.archived_at || "")).not.toBe("");
+    expect(replacement?.status).toBe("active");
+    expect(Number(replacement?.confidence)).toBeGreaterThanOrEqual(0.98);
+    expect(Number(replacement?.truth_confidence)).toBeGreaterThanOrEqual(0.98);
+    expect(Number(replacement?.activation_strength)).toBeGreaterThanOrEqual(0.9);
+    expect(replacement?.activation_seed).toBe("correction");
+    expect(String(replacement?.last_reviewed_at || "")).not.toBe("");
+    expect(String(replacement?.archived_at || "")).toBe("");
   });
 
   it("builds relevance-filtered proactive memory context with trigger attribution", async () => {
@@ -156,9 +225,16 @@ describe("memory mutation and proactive context", () => {
       prompt: "Can you check the vault sync issue and remind me why memory_add rejected that note?",
     });
 
+    const db = getLcmConnection(TEST_DB_PATH);
+    const reinforced = db
+      .prepare("SELECT retrieval_count, activation_strength FROM memory_current WHERE content LIKE ? LIMIT 1")
+      .get("%vault sync regressions%") as Record<string, unknown> | undefined;
+
     expect(context).toContain("<engram-relevant-memory>");
     expect(context).toContain("Triggered memories:");
     expect(context).toContain("stored_by=main");
     expect(context).toContain("Relevant memories:");
+    expect(Number(reinforced?.retrieval_count)).toBeGreaterThan(0);
+    expect(Number(reinforced?.activation_strength)).toBeGreaterThan(0);
   });
 });

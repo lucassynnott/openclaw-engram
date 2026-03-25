@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
+import { makeTestConfig } from "./test-config.js";
 import { ensureMemoryTables } from "../src/memory/memory-schema.js";
 import { hashNormalized, normalizeContent } from "../src/memory/memory-utils.js";
 import { fetchMemoryCandidates } from "../src/surface/memory-recall-core.js";
@@ -33,6 +34,14 @@ function makeDb() {
   return { db: getLcmConnection(dbPath), dbPath, dir };
 }
 
+function makeActivationConfig() {
+  return makeTestConfig({
+    databasePath: ":memory:",
+    activationModelEnabled: true,
+    activationModelRolloutFraction: 1,
+  });
+}
+
 function insertMemory(
   db: ReturnType<typeof getLcmConnection>,
   params: {
@@ -43,10 +52,14 @@ function insertMemory(
     valueScore?: number;
     status?: string;
     scope?: string;
+    createdAt?: string;
+    updatedAt?: string;
   },
 ) {
   const normalized = normalizeContent(params.content);
   const hash = hashNormalized(params.content);
+  const createdAt = params.createdAt ?? new Date().toISOString();
+  const updatedAt = params.updatedAt ?? createdAt;
   db.prepare(`
     INSERT INTO memory_current (
       memory_id, type, content, normalized, normalized_hash,
@@ -64,8 +77,8 @@ function insertMemory(
     params.scope ?? "shared",
     params.status ?? "active",
     params.valueScore ?? 0.7,
-    new Date().toISOString(),
-    new Date().toISOString(),
+    createdAt,
+    updatedAt,
   );
 }
 
@@ -323,7 +336,7 @@ describe("search ranking — score composition and sorting", () => {
     // The final score = rawScore * typeMultiplier
     // Verify the breakdown components exist and multiply correctly
     const bd = mem!.scoreBreakdown;
-    const rawScore = bd.confidence + bd.value + bd.lexical + bd.vector + bd.temporal + bd.entity;
+    const rawScore = bd.confidence * bd.activation + bd.value + bd.lexical + bd.vector + bd.temporal + bd.entity;
     expect(mem!.score).toBeCloseTo(rawScore * bd.typeMultiplier, 2);
   });
 
@@ -371,5 +384,94 @@ describe("search ranking — score composition and sorting", () => {
         `memories[${i - 1}].score >= memories[${i}].score`,
       ).toBeGreaterThanOrEqual(result.memories[i].score);
     }
+  });
+});
+
+describe("search ranking — activation-aware confidence", () => {
+  it("falls back to legacy recency decay when activation columns are absent", async () => {
+    const { db } = makeDb();
+    ensureMemoryTables(db);
+
+    insertMemory(db, {
+      memoryId: "mem_activation_fresh",
+      type: "USER_FACT",
+      content: "Activation fallback check for ranking behavior",
+      confidence: 0.9,
+      valueScore: 0.7,
+      createdAt: "2026-03-20T10:00:00.000Z",
+      updatedAt: "2026-03-20T10:00:00.000Z",
+    });
+    insertMemory(db, {
+      memoryId: "mem_activation_old",
+      type: "USER_FACT",
+      content: "Activation fallback check for ranking behavior older",
+      confidence: 0.9,
+      valueScore: 0.7,
+      createdAt: "2025-01-01T10:00:00.000Z",
+      updatedAt: "2025-01-01T10:00:00.000Z",
+    });
+
+    const result = await fetchMemoryCandidates(db, {
+      config: makeActivationConfig(),
+      query: "activation fallback ranking behavior",
+      topK: 10,
+      minScore: 0,
+      maxTokens: 5000,
+      allScopes: true,
+    });
+
+    const fresh = result.memories.find((m) => m.id === "mem_activation_fresh");
+    const old = result.memories.find((m) => m.id === "mem_activation_old");
+    expect(fresh).toBeDefined();
+    expect(old).toBeDefined();
+    expect(fresh!.effectiveConfidence).toBeGreaterThan(old!.effectiveConfidence);
+  });
+
+  it("treats zero activation values as fallback and non-zero values as retrievability signals", async () => {
+    const { db } = makeDb();
+    ensureMemoryTables(db);
+    db.exec("ALTER TABLE memory_current ADD COLUMN activation REAL");
+
+    insertMemory(db, {
+      memoryId: "mem_activation_zero",
+      type: "USER_FACT",
+      content: "Activation signal ranking memory zero",
+      confidence: 0.9,
+      valueScore: 0.7,
+      createdAt: "2025-01-01T10:00:00.000Z",
+      updatedAt: "2025-01-01T10:00:00.000Z",
+    });
+    insertMemory(db, {
+      memoryId: "mem_activation_boosted",
+      type: "USER_FACT",
+      content: "Activation signal ranking memory boosted",
+      confidence: 0.9,
+      valueScore: 0.7,
+      createdAt: "2025-01-01T10:00:00.000Z",
+      updatedAt: "2025-01-01T10:00:00.000Z",
+    });
+
+    db.prepare("UPDATE memory_current SET activation = ? WHERE memory_id = ?").run(0, "mem_activation_zero");
+    db.prepare("UPDATE memory_current SET activation = ? WHERE memory_id = ?").run(0.95, "mem_activation_boosted");
+
+    const result = await fetchMemoryCandidates(db, {
+      config: makeActivationConfig(),
+      query: "activation signal ranking memory",
+      topK: 10,
+      minScore: 0,
+      maxTokens: 5000,
+      allScopes: true,
+    });
+
+    const zero = result.memories.find((m) => m.id === "mem_activation_zero");
+    const boosted = result.memories.find((m) => m.id === "mem_activation_boosted");
+    expect(zero).toBeDefined();
+    expect(boosted).toBeDefined();
+
+    // Zero activation should fall back to legacy decay and remain non-zero.
+    expect(zero!.activation).toBeGreaterThan(0);
+    expect(boosted!.activation).toBeGreaterThan(zero!.activation);
+    expect(boosted!.effectiveConfidence).toBeGreaterThan(zero!.effectiveConfidence);
+    expect(boosted!.score).toBeGreaterThan(zero!.score);
   });
 });

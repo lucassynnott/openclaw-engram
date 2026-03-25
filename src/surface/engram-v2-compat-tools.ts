@@ -12,7 +12,9 @@ import {
   listEntityMergeSuggestions,
   mergeEntities,
 } from "../entity/world-model.js";
+import { activationRolloutFraction, resolveHygieneTieringMode } from "../memory/activation-rollout.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
+import { isHeartbeatPattern } from "../memory/memory-utils.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { createAlignmentCheckTool, createAlignmentStatusTool } from "./alignment-tools.js";
@@ -125,6 +127,13 @@ const VaultQuerySchema = Type.Object({
   ),
 });
 
+const OPS_STATUS_SPAM_PATTERNS: RegExp[] = [
+  /^\s*(?:status|health)\s*[:=\-]\s*(?:ok|pass|good|clean|nominal|unchanged|stable)\s*$/i,
+  /\b(?:status|health)\s+(?:is|remains|stays)\s+(?:ok|good|clean|nominal|unchanged|stable)\b/i,
+  /\b(?:no|without)\s+(?:issues?|changes?|updates?)\b/i,
+  /^\s*heartbeat_ok\b/i,
+];
+
 type VaultMirrorSearchResult = {
   path: string;
   category: string;
@@ -204,6 +213,96 @@ function scalarCount(db: DatabaseSync, tableName: string, whereClause = ""): num
   const sql = `SELECT COUNT(*) AS c FROM ${tableName}${whereClause ? ` WHERE ${whereClause}` : ""}`;
   const row = db.prepare(sql).get() as Record<string, unknown> | undefined;
   return Number(row?.c || 0);
+}
+
+function scalarQueryCount(
+  db: DatabaseSync,
+  sql: string,
+  params: Array<string | number> = [],
+): number {
+  try {
+    const row = db.prepare(sql).get(...params) as Record<string, unknown> | undefined;
+    return Number(row?.c || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function countMemoryEvents(
+  db: DatabaseSync,
+  input: { action: string; component?: string },
+): number {
+  if (!hasTable(db, "memory_events")) return 0;
+  const where: string[] = ["action = ?"];
+  const params: Array<string | number> = [input.action];
+  if (input.component) {
+    where.push("component = ?");
+    params.push(input.component);
+  }
+  return scalarQueryCount(db, `SELECT COUNT(*) AS c FROM memory_events WHERE ${where.join(" AND ")}`, params);
+}
+
+function isHeartbeatOrStatusSpam(content: string): boolean {
+  const text = content.trim();
+  if (isHeartbeatPattern(text)) return true;
+  return OPS_STATUS_SPAM_PATTERNS.some((re) => re.test(text));
+}
+
+function summarizeColdTierEpisodes(db: DatabaseSync): {
+  candidates: number;
+  archived: number;
+  scanned: number;
+} {
+  if (!hasTable(db, "memory_current")) {
+    return { candidates: 0, archived: 0, scanned: 0 };
+  }
+
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = db.prepare(`
+    SELECT
+      m.status,
+      m.content,
+      m.value_score,
+      m.last_reviewed_at,
+      COALESCE(a.activation_events, 0) AS activation_events
+    FROM memory_current m
+    LEFT JOIN (
+      SELECT
+        memory_id,
+        COUNT(*) AS activation_events
+      FROM memory_events
+      WHERE action <> 'store'
+      GROUP BY memory_id
+    ) a
+      ON a.memory_id = m.memory_id
+    WHERE m.type = 'EPISODE'
+      AND m.status IN ('active', 'archived')
+      AND COALESCE(m.content_time, m.created_at) < ?
+  `).all(cutoff) as Array<Record<string, unknown>>;
+
+  let candidates = 0;
+  let archived = 0;
+  for (const row of rows) {
+    const content = String(row.content || "");
+    if (isHeartbeatOrStatusSpam(content)) continue;
+
+    const lastReviewedAt = typeof row.last_reviewed_at === "string" ? row.last_reviewed_at : null;
+    if (lastReviewedAt) continue;
+
+    const valueScore = Number(row.value_score ?? 0);
+    if (!Number.isFinite(valueScore) || valueScore > 0.35) continue;
+
+    const activationEvents = Number(row.activation_events ?? 0);
+    if (Number.isFinite(activationEvents) && activationEvents > 0) continue;
+
+    if (String(row.status || "") === "archived") {
+      archived += 1;
+    } else {
+      candidates += 1;
+    }
+  }
+
+  return { candidates, archived, scanned: rows.length };
 }
 
 function ensureCompatMemoryTables(db: DatabaseSync): void {
@@ -879,6 +978,26 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
           return [];
         }
       })();
+      const activationEnabled = Boolean(input.config.activationModelEnabled);
+      const rolloutFraction = activationRolloutFraction(input.config);
+      const hygieneTieringMode = resolveHygieneTieringMode(input.config);
+      const reinforceCaptureEvents = countMemoryEvents(db, { action: "reinforce_capture" });
+      const reinforceQueryEvents = countMemoryEvents(db, { action: "reinforce_query", component: "memory_query" });
+      const reinforceSearchEvents = countMemoryEvents(db, { action: "reinforce_search", component: "memory_search" });
+      const reinforceExplicitRecallEvents = countMemoryEvents(db, { action: "reinforce_recall", component: "memory_recall" });
+      const reinforceProactiveRecallEvents = countMemoryEvents(db, { action: "reinforce_recall", component: "proactive_context" });
+      const reinforceTriggerEvents = countMemoryEvents(db, { action: "reinforce_trigger", component: "proactive_context" });
+      const totalReinforcementEvents =
+        reinforceCaptureEvents
+        + reinforceQueryEvents
+        + reinforceSearchEvents
+        + reinforceExplicitRecallEvents
+        + reinforceProactiveRecallEvents
+        + reinforceTriggerEvents;
+      const duplicateToReinforceRatio = totalReinforcementEvents > 0
+        ? Number((reinforceCaptureEvents / totalReinforcementEvents).toFixed(4))
+        : 0;
+      const coldTier = summarizeColdTierEpisodes(db);
 
       return jsonResult({
         status: issues.length === 0 ? "healthy" : "degraded",
@@ -907,6 +1026,29 @@ export function createOpsStatusTool(input: { config: LcmConfig }): AnyAgentTool 
           vector_rows: scalarCount(db, "memory_vectors"),
           vector_backend: input.config.vectorBackend,
           vector_runtime: vectorRuntimeStats,
+          activation_model: {
+            enabled: activationEnabled,
+            rollout_fraction: rolloutFraction,
+            hygiene_tiering_mode: hygieneTieringMode,
+            memories_with_lifecycle: scalarCount(
+              db,
+              "memory_current",
+              "truth_confidence IS NOT NULL OR activation_strength IS NOT NULL",
+            ),
+            reinforced_memories: scalarCount(db, "memory_current", "COALESCE(reinforcement_count, 0) > 0"),
+            retrieved_memories: scalarCount(db, "memory_current", "COALESCE(retrieval_count, 0) > 0"),
+            decay_exempt_memories: scalarCount(db, "memory_current", "COALESCE(decay_exempt, 0) = 1"),
+            reinforce_capture_events: reinforceCaptureEvents,
+            reinforce_query_events: reinforceQueryEvents,
+            reinforce_search_events: reinforceSearchEvents,
+            reinforce_explicit_recall_events: reinforceExplicitRecallEvents,
+            reinforce_proactive_recall_events: reinforceProactiveRecallEvents,
+            reinforce_trigger_events: reinforceTriggerEvents,
+            total_reinforcement_events: totalReinforcementEvents,
+            duplicate_to_reinforce_ratio: duplicateToReinforceRatio,
+            cold_tier_candidate_episodes: coldTier.candidates,
+            cold_tier_archived_episodes: coldTier.archived,
+          },
         },
         lcm: {
           conversations: scalarCount(db, "conversations"),

@@ -23,6 +23,13 @@ type MemoryRow = {
   normalized_hash: string;
   source: string;
   confidence: number;
+  truth_confidence: number | null;
+  activation_strength: number | null;
+  reinforcement_count: number | null;
+  retrieval_count: number | null;
+  last_reinforced_at: string | null;
+  last_retrieved_at: string | null;
+  decay_exempt: number | null;
   scope: string;
   status: string;
   value_score: number | null;
@@ -51,6 +58,15 @@ type ParsedEntry = {
   sourceLine: number;
   relatedEntities: string[];
   supersededBy: string | null;
+  truthConfidence: number | null;
+  activationStrength: number | null;
+  reinforcementCount: number | null;
+  retrievalCount: number | null;
+  lastReinforcedAt: string | null;
+  lastRetrievedAt: string | null;
+  decayExempt: number | null;
+  legacyLastAccessed: string | null;
+  legacyAccessCount: number | null;
 };
 
 export type NativeReindexResult = {
@@ -191,6 +207,69 @@ function parseYamlScalar(raw: string): string | null {
   return value;
 }
 
+function parseYamlNumber(raw: string): number | null {
+  const value = parseYamlScalar(raw);
+  if (value === null) return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "true") return 1;
+  if (normalized === "false") return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseYamlInteger(raw: string): number | null {
+  const parsed = parseYamlNumber(raw);
+  return parsed === null ? null : Math.trunc(parsed);
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+type ResolvedLifecycleFields = {
+  truthConfidence: number | null;
+  activationStrength: number;
+  reinforcementCount: number;
+  retrievalCount: number;
+  lastReinforcedAt: string | null;
+  lastRetrievedAt: string | null;
+  decayExempt: number;
+};
+
+function resolveLifecycleFields(entry: ParsedEntry, existing: MemoryRow | null, confidence: number): ResolvedLifecycleFields {
+  const existingTruth = existing ? toFiniteNumber(existing.truth_confidence ?? existing.confidence) : null;
+  const existingActivation = existing ? toFiniteNumber(existing.activation_strength) : null;
+  const existingReinforcementCount = existing ? Math.max(0, Math.trunc(toFiniteNumber(existing.reinforcement_count) ?? 0)) : 0;
+  const existingRetrievalCount = existing ? Math.max(0, Math.trunc(toFiniteNumber(existing.retrieval_count) ?? 0)) : 0;
+  const existingDecayExempt = existing ? Math.max(0, Math.trunc(toFiniteNumber(existing.decay_exempt) ?? 0)) : 0;
+  const legacyLastAccessed = existing ? null : (entry.legacyLastAccessed ?? null);
+
+  return {
+    truthConfidence: entry.truthConfidence ?? existingTruth ?? confidence,
+    activationStrength: entry.activationStrength ?? existingActivation ?? 0,
+    reinforcementCount: entry.reinforcementCount ?? existingReinforcementCount,
+    retrievalCount: entry.retrievalCount ?? existingRetrievalCount ?? entry.legacyAccessCount ?? 0,
+    lastReinforcedAt:
+      entry.lastReinforcedAt ??
+      entry.lastRetrievedAt ??
+      legacyLastAccessed ??
+      existing?.last_reinforced_at ??
+      null,
+    lastRetrievedAt:
+      entry.lastRetrievedAt ??
+      entry.lastReinforcedAt ??
+      legacyLastAccessed ??
+      existing?.last_retrieved_at ??
+      null,
+    decayExempt: entry.decayExempt ?? existingDecayExempt,
+  };
+}
+
 function deterministicNativeMemoryId(entry: ParsedEntry): string {
   return `mem_native_${hashNormalized(`${entry.sourceLayer}:${entry.sourcePath}:${entry.content}`)}`.slice(0, 27);
 }
@@ -259,6 +338,15 @@ function parseManagedMarkdown(filePath: string, rootDir: string): ParsedEntry[] 
       sourceLine: index + 1,
       relatedEntities: [],
       supersededBy: null,
+      truthConfidence: null,
+      activationStrength: null,
+      reinforcementCount: null,
+      retrievalCount: null,
+      lastReinforcedAt: null,
+      lastRetrievedAt: null,
+      decayExempt: null,
+      legacyLastAccessed: null,
+      legacyAccessCount: null,
     });
   }
 
@@ -300,6 +388,15 @@ function parseItemsYaml(filePath: string, rootDir: string): ParsedEntry[] {
       sourceLine: current.sourceLine,
       relatedEntities: current.relatedEntities,
       supersededBy: current.supersededBy,
+      truthConfidence: current.truthConfidence,
+      activationStrength: current.activationStrength,
+      reinforcementCount: current.reinforcementCount,
+      retrievalCount: current.retrievalCount,
+      lastReinforcedAt: current.lastReinforcedAt,
+      lastRetrievedAt: current.lastRetrievedAt,
+      decayExempt: current.decayExempt,
+      legacyLastAccessed: current.legacyLastAccessed,
+      legacyAccessCount: current.legacyAccessCount,
     });
     current = null;
     readingRelated = false;
@@ -323,6 +420,15 @@ function parseItemsYaml(filePath: string, rootDir: string): ParsedEntry[] {
         relatedEntities: [],
         supersededBy: null,
         category: null,
+        truthConfidence: null,
+        activationStrength: null,
+        reinforcementCount: null,
+        retrievalCount: null,
+        lastReinforcedAt: null,
+        lastRetrievedAt: null,
+        decayExempt: null,
+        legacyLastAccessed: null,
+        legacyAccessCount: null,
       };
       continue;
     }
@@ -375,6 +481,34 @@ function parseItemsYaml(filePath: string, rootDir: string): ParsedEntry[] {
       case "superseded_by":
         current.supersededBy = value;
         break;
+      case "truth_confidence":
+        current.truthConfidence = parseYamlNumber(fieldMatch[2]);
+        break;
+      case "activation_strength":
+        current.activationStrength = parseYamlNumber(fieldMatch[2]);
+        break;
+      case "reinforcement_count":
+        current.reinforcementCount = parseYamlInteger(fieldMatch[2]);
+        break;
+      case "retrieval_count":
+        current.retrievalCount = parseYamlInteger(fieldMatch[2]);
+        break;
+      case "last_reinforced_at":
+        current.lastReinforcedAt = value;
+        break;
+      case "last_retrieved_at":
+        current.lastRetrievedAt = value;
+        break;
+      case "decay_exempt":
+        current.decayExempt = parseYamlInteger(fieldMatch[2]);
+        break;
+      case "last_accessed":
+      case "last_accessed_at":
+        current.legacyLastAccessed = value;
+        break;
+      case "access_count":
+        current.legacyAccessCount = parseYamlInteger(fieldMatch[2]);
+        break;
       default:
         break;
     }
@@ -415,7 +549,9 @@ function getAllMemories(db: DatabaseSync): MemoryRow[] {
   return db.prepare(`
     SELECT
       memory_id, type, content, normalized, normalized_hash, source,
-      confidence, scope, status, value_score, value_label,
+      confidence, truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+      last_reinforced_at, last_retrieved_at, decay_exempt,
+      scope, status, value_score, value_label,
       created_at, updated_at, archived_at, tags, superseded_by,
       content_time, valid_until, source_layer, source_path, source_line
     FROM memory_current
@@ -429,6 +565,13 @@ function sameMemoryProjection(row: MemoryRow, next: {
   normalized: string;
   normalizedHash: string;
   confidence: number;
+  truthConfidence: number | null;
+  activationStrength: number;
+  reinforcementCount: number;
+  retrievalCount: number;
+  lastReinforcedAt: string | null;
+  lastRetrievedAt: string | null;
+  decayExempt: number;
   scope: string;
   status: string;
   valueScore: number;
@@ -447,6 +590,13 @@ function sameMemoryProjection(row: MemoryRow, next: {
     row.normalized === next.normalized &&
     row.normalized_hash === next.normalizedHash &&
     Number(row.confidence || 0) === next.confidence &&
+    Number(row.truth_confidence ?? row.confidence ?? 0) === Number(next.truthConfidence ?? next.confidence) &&
+    Number(row.activation_strength ?? 0) === next.activationStrength &&
+    Number(row.reinforcement_count ?? 0) === next.reinforcementCount &&
+    Number(row.retrieval_count ?? 0) === next.retrievalCount &&
+    String(row.last_reinforced_at || "") === String(next.lastReinforcedAt || "") &&
+    String(row.last_retrieved_at || "") === String(next.lastRetrievedAt || "") &&
+    Number(row.decay_exempt ?? 0) === next.decayExempt &&
     row.scope === next.scope &&
     row.status === next.status &&
     Number(row.value_score || 0) === next.valueScore &&
@@ -474,6 +624,13 @@ function sameSemanticPayload(row: MemoryRow, next: {
   content: string;
   normalized: string;
   normalizedHash: string;
+  truthConfidence: number | null;
+  activationStrength: number;
+  reinforcementCount: number;
+  retrievalCount: number;
+  lastReinforcedAt: string | null;
+  lastRetrievedAt: string | null;
+  decayExempt: number;
   scope: string;
   status: string;
   tags: string;
@@ -487,6 +644,13 @@ function sameSemanticPayload(row: MemoryRow, next: {
     row.content === next.content &&
     row.normalized === next.normalized &&
     row.normalized_hash === next.normalizedHash &&
+    Number(row.truth_confidence ?? row.confidence ?? 0) === Number(next.truthConfidence ?? row.confidence ?? 0) &&
+    Number(row.activation_strength ?? 0) === next.activationStrength &&
+    Number(row.reinforcement_count ?? 0) === next.reinforcementCount &&
+    Number(row.retrieval_count ?? 0) === next.retrievalCount &&
+    String(row.last_reinforced_at || "") === String(next.lastReinforcedAt || "") &&
+    String(row.last_retrieved_at || "") === String(next.lastRetrievedAt || "") &&
+    Number(row.decay_exempt ?? 0) === next.decayExempt &&
     row.scope === next.scope &&
     row.status === next.status &&
     JSON.stringify(canonicalRelatedEntitiesFromTags(row.tags || "[]")) ===
@@ -581,10 +745,11 @@ export function reindexNativeMemoryLayer(input: {
   const insertStmt = input.db.prepare(`
     INSERT INTO memory_current (
       memory_id, type, content, normalized, normalized_hash,
-      source, confidence, scope, status, value_score, value_label,
+      source, confidence, truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+      last_reinforced_at, last_retrieved_at, decay_exempt, scope, status, value_score, value_label,
       created_at, updated_at, archived_at, tags, superseded_by,
       content_time, source_layer, source_path, source_line
-    ) VALUES (?, ?, ?, ?, ?, 'native_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, 'native_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const updateStmt = input.db.prepare(`
@@ -596,6 +761,13 @@ export function reindexNativeMemoryLayer(input: {
       normalized_hash = ?,
       source = 'native_file',
       confidence = ?,
+      truth_confidence = ?,
+      activation_strength = ?,
+      reinforcement_count = ?,
+      retrieval_count = ?,
+      last_reinforced_at = ?,
+      last_retrieved_at = ?,
+      decay_exempt = ?,
       scope = ?,
       status = ?,
       value_score = ?,
@@ -632,12 +804,20 @@ export function reindexNativeMemoryLayer(input: {
     const existingById = entry.memoryId ? rowById.get(entry.memoryId) : null;
     const duplicateKey = `${normalizedHash}|${entry.scope}`;
     const duplicate = bestByHashScope.get(duplicateKey);
+    const lifecycle = resolveLifecycleFields(entry, existingById ?? duplicate ?? null, confidence);
     const sameSemanticRow = existingById
       ? sameSemanticPayload(existingById, {
           kind: entry.kind,
           content: entry.content,
           normalized,
           normalizedHash,
+          truthConfidence: lifecycle.truthConfidence,
+          activationStrength: lifecycle.activationStrength,
+          reinforcementCount: lifecycle.reinforcementCount,
+          retrievalCount: lifecycle.retrievalCount,
+          lastReinforcedAt: lifecycle.lastReinforcedAt,
+          lastRetrievedAt: lifecycle.lastRetrievedAt,
+          decayExempt: lifecycle.decayExempt,
           scope: entry.scope,
           status: entry.status,
           tags: tagsJson,
@@ -675,6 +855,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized,
         normalizedHash,
         confidence,
+        truthConfidence: lifecycle.truthConfidence,
+        activationStrength: lifecycle.activationStrength,
+        reinforcementCount: lifecycle.reinforcementCount,
+        retrievalCount: lifecycle.retrievalCount,
+        lastReinforcedAt: lifecycle.lastReinforcedAt,
+        lastRetrievedAt: lifecycle.lastRetrievedAt,
+        decayExempt: lifecycle.decayExempt,
         scope: entry.scope,
         status: entry.status,
         valueScore: classification.value_score,
@@ -697,6 +884,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized,
         normalizedHash,
         confidence,
+        lifecycle.truthConfidence,
+        lifecycle.activationStrength,
+        lifecycle.reinforcementCount,
+        lifecycle.retrievalCount,
+        lifecycle.lastReinforcedAt,
+        lifecycle.lastRetrievedAt,
+        lifecycle.decayExempt,
         entry.scope,
         entry.status,
         classification.value_score,
@@ -720,6 +914,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized_hash: normalizedHash,
         source: "native_file",
         confidence,
+        truth_confidence: lifecycle.truthConfidence,
+        activation_strength: lifecycle.activationStrength,
+        reinforcement_count: lifecycle.reinforcementCount,
+        retrieval_count: lifecycle.retrievalCount,
+        last_reinforced_at: lifecycle.lastReinforcedAt,
+        last_retrieved_at: lifecycle.lastRetrievedAt,
+        decay_exempt: lifecycle.decayExempt,
         scope: entry.scope,
         status: entry.status,
         value_score: classification.value_score,
@@ -762,6 +963,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized,
         normalizedHash,
         confidence,
+        truthConfidence: lifecycle.truthConfidence,
+        activationStrength: lifecycle.activationStrength,
+        reinforcementCount: lifecycle.reinforcementCount,
+        retrievalCount: lifecycle.retrievalCount,
+        lastReinforcedAt: lifecycle.lastReinforcedAt,
+        lastRetrievedAt: lifecycle.lastRetrievedAt,
+        decayExempt: lifecycle.decayExempt,
         scope: entry.scope,
         status: entry.status,
         valueScore: classification.value_score,
@@ -784,6 +992,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized,
         normalizedHash,
         confidence,
+        lifecycle.truthConfidence,
+        lifecycle.activationStrength,
+        lifecycle.reinforcementCount,
+        lifecycle.retrievalCount,
+        lifecycle.lastReinforcedAt,
+        lifecycle.lastRetrievedAt,
+        lifecycle.decayExempt,
         entry.scope,
         entry.status,
         classification.value_score,
@@ -807,6 +1022,13 @@ export function reindexNativeMemoryLayer(input: {
         normalized_hash: normalizedHash,
         source: "native_file",
         confidence,
+        truth_confidence: lifecycle.truthConfidence,
+        activation_strength: lifecycle.activationStrength,
+        reinforcement_count: lifecycle.reinforcementCount,
+        retrieval_count: lifecycle.retrievalCount,
+        last_reinforced_at: lifecycle.lastReinforcedAt,
+        last_retrieved_at: lifecycle.lastRetrievedAt,
+        decay_exempt: lifecycle.decayExempt,
         scope: entry.scope,
         status: entry.status,
         value_score: classification.value_score,
@@ -843,6 +1065,13 @@ export function reindexNativeMemoryLayer(input: {
       normalized,
       normalizedHash,
       confidence,
+      lifecycle.truthConfidence,
+      lifecycle.activationStrength,
+      lifecycle.reinforcementCount,
+      lifecycle.retrievalCount,
+      lifecycle.lastReinforcedAt,
+      lifecycle.lastRetrievedAt,
+      lifecycle.decayExempt,
       entry.scope,
       entry.status,
       classification.value_score,
@@ -866,6 +1095,13 @@ export function reindexNativeMemoryLayer(input: {
       normalized_hash: normalizedHash,
       source: "native_file",
       confidence,
+      truth_confidence: lifecycle.truthConfidence,
+      activation_strength: lifecycle.activationStrength,
+      reinforcement_count: lifecycle.reinforcementCount,
+      retrieval_count: lifecycle.retrievalCount,
+      last_reinforced_at: lifecycle.lastReinforcedAt,
+      last_retrieved_at: lifecycle.lastRetrievedAt,
+      decay_exempt: lifecycle.decayExempt,
       scope: entry.scope,
       status: entry.status,
       value_score: classification.value_score,
@@ -1046,6 +1282,8 @@ function renderItemsYaml(rows: MemoryRow[]): { content: string; lineByMemoryId: 
   for (const row of rows) {
     lineByMemoryId.set(row.memory_id, lines.length + 1);
     const relatedEntities = parseTags(row.tags);
+    const lastAccessed = row.last_retrieved_at || row.last_reinforced_at || dayKey(row);
+    const accessCount = typeof row.retrieval_count === "number" ? row.retrieval_count : 0;
     lines.push(`- id: ${yamlScalar(row.memory_id)}`);
     lines.push(`  fact: ${yamlScalar(row.content)}`);
     lines.push(`  kind: ${yamlScalar(row.type)}`);
@@ -1063,8 +1301,15 @@ function renderItemsYaml(rows: MemoryRow[]): { content: string; lineByMemoryId: 
         lines.push(`    - ${yamlScalar(related)}`);
       }
     }
-    lines.push(`  last_accessed: ${yamlScalar(dayKey(row))}`);
-    lines.push("  access_count: 0");
+    lines.push(`  last_accessed: ${yamlScalar(lastAccessed)}`);
+    lines.push(`  access_count: ${yamlScalar(accessCount)}`);
+    lines.push(`  truth_confidence: ${yamlScalar(row.truth_confidence ?? row.confidence ?? null)}`);
+    lines.push(`  activation_strength: ${yamlScalar(row.activation_strength ?? null)}`);
+    lines.push(`  reinforcement_count: ${yamlScalar(row.reinforcement_count ?? 0)}`);
+    lines.push(`  retrieval_count: ${yamlScalar(row.retrieval_count ?? 0)}`);
+    lines.push(`  last_reinforced_at: ${yamlScalar(row.last_reinforced_at ?? null)}`);
+    lines.push(`  last_retrieved_at: ${yamlScalar(row.last_retrieved_at ?? null)}`);
+    lines.push(`  decay_exempt: ${yamlScalar(row.decay_exempt ?? 0)}`);
   }
 
   return {

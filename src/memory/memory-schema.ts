@@ -12,6 +12,80 @@ function ensureColumn(db: DatabaseSync, tableName: string, columnSql: string, co
   db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnSql}`);
 }
 
+function backfillMemoryLifecycleFields(db: DatabaseSync): void {
+  db.exec(`
+    UPDATE memory_current
+    SET truth_confidence = COALESCE(confidence, truth_confidence, 0.75)
+    WHERE truth_confidence IS NULL
+       OR COALESCE(NULLIF(activation_seed, ''), '') = '';
+
+    UPDATE memory_current
+    SET first_seen_at = COALESCE(first_seen_at, created_at, updated_at, content_time, last_reviewed_at)
+    WHERE first_seen_at IS NULL;
+
+    UPDATE memory_current
+    SET last_seen_at = COALESCE(last_seen_at, updated_at, last_reviewed_at, content_time, created_at, first_seen_at)
+    WHERE last_seen_at IS NULL;
+
+    UPDATE memory_current
+    SET last_reinforced_at = COALESCE(last_reinforced_at, last_reviewed_at, updated_at, content_time, created_at, last_seen_at)
+    WHERE last_reinforced_at IS NULL
+      AND COALESCE(status, 'active') <> 'superseded';
+
+    UPDATE memory_current
+    SET last_retrieved_at = COALESCE(last_retrieved_at, last_reviewed_at, updated_at, content_time, created_at)
+    WHERE last_retrieved_at IS NULL
+      AND COALESCE(retrieval_count, 0) > 0;
+
+    UPDATE memory_current
+    SET retrieval_count = COALESCE(retrieval_count, 0)
+    WHERE retrieval_count IS NULL;
+
+    UPDATE memory_current
+    SET decay_exempt = COALESCE(decay_exempt, 0)
+    WHERE decay_exempt IS NULL;
+
+    UPDATE memory_current
+    SET activation_seed = 'backfill'
+    WHERE COALESCE(NULLIF(activation_seed, ''), '') = '';
+
+    UPDATE memory_current
+    SET reinforcement_count = CASE
+      WHEN COALESCE(reinforcement_count, 0) > 0 THEN reinforcement_count
+      WHEN COALESCE(status, 'active') = 'active' THEN 1
+      ELSE 0
+    END
+    WHERE reinforcement_count IS NULL
+       OR reinforcement_count = 0;
+
+    UPDATE memory_current
+    SET activation_strength = ROUND(
+      CASE
+        WHEN COALESCE(status, 'active') = 'active' THEN
+          MIN(
+            1.0,
+            MAX(
+              0.35,
+              COALESCE(truth_confidence, confidence, 0.75) * 0.62 +
+              COALESCE(value_score, 0.5) * 0.38
+            )
+          )
+        ELSE
+          MIN(
+            1.0,
+            MAX(
+              0.08,
+              COALESCE(truth_confidence, confidence, 0.75) * 0.28 +
+              COALESCE(value_score, 0.3) * 0.22
+            )
+          )
+      END,
+      4
+    )
+    WHERE COALESCE(activation_strength, 0) <= 0;
+  `);
+}
+
 export function ensureMemoryTables(db: DatabaseSync): void {
   if (initialized.has(db)) return;
 
@@ -27,6 +101,16 @@ export function ensureMemoryTables(db: DatabaseSync): void {
       source_session TEXT,
       source_trigger TEXT,
       confidence REAL DEFAULT 0.75,
+      truth_confidence REAL DEFAULT 0.75,
+      activation_strength REAL NOT NULL DEFAULT 0,
+      activation_seed TEXT,
+      reinforcement_count INTEGER NOT NULL DEFAULT 0,
+      retrieval_count INTEGER NOT NULL DEFAULT 0,
+      last_reinforced_at TEXT,
+      last_retrieved_at TEXT,
+      first_seen_at TEXT,
+      last_seen_at TEXT,
+      decay_exempt INTEGER NOT NULL DEFAULT 0,
       scope TEXT NOT NULL DEFAULT 'shared',
       status TEXT NOT NULL DEFAULT 'active',
       value_score REAL,
@@ -111,6 +195,17 @@ export function ensureMemoryTables(db: DatabaseSync): void {
   ensureColumn(db, "memory_current", "source_layer TEXT NOT NULL DEFAULT 'registry'", "source_layer");
   ensureColumn(db, "memory_current", "source_path TEXT", "source_path");
   ensureColumn(db, "memory_current", "source_line INTEGER", "source_line");
+  ensureColumn(db, "memory_current", "truth_confidence REAL DEFAULT 0.75", "truth_confidence");
+  ensureColumn(db, "memory_current", "activation_strength REAL NOT NULL DEFAULT 0", "activation_strength");
+  ensureColumn(db, "memory_current", "activation_seed TEXT", "activation_seed");
+  ensureColumn(db, "memory_current", "reinforcement_count INTEGER NOT NULL DEFAULT 0", "reinforcement_count");
+  ensureColumn(db, "memory_current", "retrieval_count INTEGER NOT NULL DEFAULT 0", "retrieval_count");
+  ensureColumn(db, "memory_current", "last_reinforced_at TEXT", "last_reinforced_at");
+  ensureColumn(db, "memory_current", "last_retrieved_at TEXT", "last_retrieved_at");
+  ensureColumn(db, "memory_current", "first_seen_at TEXT", "first_seen_at");
+  ensureColumn(db, "memory_current", "last_seen_at TEXT", "last_seen_at");
+  ensureColumn(db, "memory_current", "decay_exempt INTEGER NOT NULL DEFAULT 0", "decay_exempt");
+  backfillMemoryLifecycleFields(db);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_memory_current_source
       ON memory_current(source_layer, source_path, source_line);

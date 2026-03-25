@@ -2,6 +2,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "../db/features.js";
 import type { LcmConfig } from "../db/config.js";
 import { ensureWorldModelReady, findEntityMatches, getEntityDetail } from "../entity/world-model.js";
+import { computeActivationStrength } from "../memory/activation.js";
+import { isActivationModelEnabledForSeed } from "../memory/activation-rollout.js";
 import { ensureMemoryTables } from "../memory/memory-schema.js";
 import { sanitizeFts5Query } from "../memory/store/fts5-sanitize.js";
 import {
@@ -24,6 +26,7 @@ export type MemoryRecallCandidate = {
   content: string;
   scope: string;
   confidence: number;
+  activation: number;
   effectiveConfidence: number;
   valueScore: number;
   tags: string[];
@@ -38,6 +41,7 @@ export type MemoryRecallCandidate = {
   score: number;
   scoreBreakdown: {
     confidence: number;
+    activation: number;
     value: number;
     lexical: number;
     vector: number;
@@ -49,8 +53,59 @@ export type MemoryRecallCandidate = {
   estimatedTokens: number;
 };
 
-const CONFIDENCE_HALF_LIFE_DAYS = 14;
-const CONFIDENCE_DECAY_FLOOR = 0.45;
+const CONFIDENCE_SCORE_WEIGHT = 0.5;
+const VALUE_SCORE_WEIGHT = 0.18;
+const FALLBACK_ACTIVATION_HALF_LIFE_DAYS = 14;
+const FALLBACK_ACTIVATION_FLOOR = 0.45;
+const EXPIRED_ACTIVATION = 0.35;
+
+const MEMORY_SELECT_REQUIRED_COLUMNS = [
+  "memory_id",
+  "type",
+  "content",
+  "scope",
+  "confidence",
+  "value_score",
+  "tags",
+  "created_at",
+  "updated_at",
+  "content_time",
+  "valid_until",
+  "status",
+  "archived_at",
+  "source_agent",
+] as const;
+const MEMORY_SELECT_OPTIONAL_COLUMNS = [
+  "truth_confidence",
+  "activation_strength",
+  "reinforcement_count",
+  "retrieval_count",
+  "last_reinforced_at",
+  "last_retrieved_at",
+  "first_seen_at",
+  "last_seen_at",
+  "decay_exempt",
+  "last_reviewed_at",
+  "activation",
+  "retrievability",
+  "retrieval_score",
+  "activation_score",
+  "recall_activation",
+  "last_accessed_at",
+  "access_count",
+  "review_count",
+  "strength",
+] as const;
+const ACTIVATION_SIGNAL_COLUMNS = [
+  "activation_strength",
+  "activation",
+  "recall_activation",
+  "retrievability",
+  "retrieval_score",
+  "activation_score",
+] as const;
+const memoryCurrentColumnsCache = new WeakMap<DatabaseSync, Set<string>>();
+const memoryCurrentSelectColumnsCache = new WeakMap<DatabaseSync, string[]>();
 
 // ── Type-based score multipliers ─────────────────────────────────────────────
 // Applied as a post-hoc multiplier on the composite score to bias ranking
@@ -107,6 +162,53 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function parseIsoDateMs(value: unknown): number {
+  return typeof value === "string" ? Date.parse(value) : NaN;
+}
+
+function getMemoryCurrentColumnSet(db: DatabaseSync): Set<string> {
+  const cached = memoryCurrentColumnsCache.get(db);
+  if (cached) {
+    return cached;
+  }
+  const columns = new Set(
+    (
+      db.prepare("PRAGMA table_info(memory_current)").all() as Array<{ name?: string }>
+    )
+      .map((row) => String(row.name || "").trim())
+      .filter(Boolean),
+  );
+  memoryCurrentColumnsCache.set(db, columns);
+  return columns;
+}
+
+function getMemoryCurrentSelectColumns(db: DatabaseSync): string[] {
+  const cached = memoryCurrentSelectColumnsCache.get(db);
+  if (cached) {
+    return cached;
+  }
+  const columns = getMemoryCurrentColumnSet(db);
+  const selected = [
+    ...MEMORY_SELECT_REQUIRED_COLUMNS.filter((column) => columns.has(column)),
+    ...MEMORY_SELECT_OPTIONAL_COLUMNS.filter((column) => columns.has(column)),
+  ];
+  memoryCurrentSelectColumnsCache.set(db, selected);
+  return selected;
+}
+
+function buildMemorySelectClause(db: DatabaseSync, tableAlias: string): string {
+  return getMemoryCurrentSelectColumns(db).map((column) => `${tableAlias}.${column}`).join(", ");
+}
+
 export function estimateTokenCount(text: string): number {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -116,6 +218,8 @@ export function estimateTokenCount(text: string): number {
 }
 
 export function ensureMemoryRecallTables(db: DatabaseSync): void {
+  memoryCurrentColumnsCache.delete(db);
+  memoryCurrentSelectColumnsCache.delete(db);
   ensureMemoryTables(db);
 }
 
@@ -217,9 +321,9 @@ function queryRows(
   const features = getLcmDbFeatures(db);
   const candidateLimit = Math.max(options.topK * 6, 24);
   const { where, params } = buildQualifiedWhereClause({ ...options, includeArchived }, "m");
+  const selectedColumns = buildMemorySelectClause(db, "m");
   const selected = `
-    SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at, m.updated_at,
-           m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent
+    SELECT ${selectedColumns}
     FROM memory_current m
   `;
 
@@ -260,11 +364,11 @@ function loadRowsByMemoryIds(
   if (memoryIds.length === 0) {
     return [];
   }
+  const selectedColumns = buildMemorySelectClause(db, "m");
   const placeholders = memoryIds.map(() => "?").join(",");
   const rows = db
     .prepare(
-      `SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent
+      `SELECT ${selectedColumns}
        FROM memory_current m
        WHERE m.memory_id IN (${placeholders})`,
     )
@@ -304,10 +408,10 @@ async function queryVectorRows(
   const queryVector = createSparseVector(query, runtime.dimensions);
   const scanLimit = Math.max(options.topK * 160, 800);
   const { where, params } = buildQualifiedWhereClause({ ...options, includeArchived }, "m");
+  const selectedColumns = buildMemorySelectClause(db, "m");
   const rows = db
     .prepare(
-      `SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-              m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent,
+      `SELECT ${selectedColumns},
               v.embedding_json, v.dense_embedding_json, v.source_updated_at AS vector_source_updated_at,
               v.algorithm AS vector_algorithm, v.dimensions AS vector_dimensions,
               v.embedding_signature
@@ -406,8 +510,7 @@ async function queryVectorRows(
            FROM memory_vector_index
            WHERE embedding MATCH ? AND k = ?
          )
-         SELECT m.memory_id, m.type, m.content, m.scope, m.confidence, m.value_score, m.tags, m.created_at,
-                m.updated_at, m.content_time, m.valid_until, m.status, m.archived_at, m.source_agent,
+         SELECT ${selectedColumns},
                 knn.distance AS vector_distance
          FROM knn
          JOIN memory_vector_rowids r ON r.vector_rowid = knn.rowid
@@ -477,16 +580,11 @@ async function queryVectorRows(
   };
 }
 
-function resolveEffectiveConfidence(row: Record<string, unknown>): number {
-  const rawConfidence = Math.max(0, Math.min(1, Number(row.confidence || 0)));
-  if (rawConfidence <= 0) {
-    return 0;
-  }
-
+function resolveLegacyActivation(row: Record<string, unknown>): number {
   const nowMs = Date.now();
-  const validUntil = typeof row.valid_until === "string" ? Date.parse(row.valid_until) : NaN;
+  const validUntil = parseIsoDateMs(row.valid_until);
   if (Number.isFinite(validUntil) && validUntil < nowMs) {
-    return Number((rawConfidence * 0.35).toFixed(4));
+    return EXPIRED_ACTIVATION;
   }
 
   const freshnessAnchor = [
@@ -495,18 +593,142 @@ function resolveEffectiveConfidence(row: Record<string, unknown>): number {
     row.content_time,
     row.created_at,
   ]
-    .map((value) => (typeof value === "string" ? Date.parse(value) : NaN))
+    .map((value) => parseIsoDateMs(value))
     .find((value) => Number.isFinite(value));
   if (!Number.isFinite(freshnessAnchor)) {
-    return rawConfidence;
+    return 1;
   }
 
   const ageDays = Math.max(0, (nowMs - Number(freshnessAnchor)) / (24 * 60 * 60 * 1000));
-  const decayFactor = Math.max(
-    CONFIDENCE_DECAY_FLOOR,
-    Math.pow(0.5, ageDays / CONFIDENCE_HALF_LIFE_DAYS),
+  const activation = Math.max(
+    FALLBACK_ACTIVATION_FLOOR,
+    Math.pow(0.5, ageDays / FALLBACK_ACTIVATION_HALF_LIFE_DAYS),
   );
-  return Number((rawConfidence * decayFactor).toFixed(4));
+  return Number(activation.toFixed(4));
+}
+
+function resolveTruthConfidence(row: Record<string, unknown>, activationModelEnabled: boolean): number {
+  if (!activationModelEnabled) {
+    return clamp01(toFiniteNumber(row.confidence) ?? 0);
+  }
+  const explicitTruth = toFiniteNumber(row.truth_confidence);
+  if (typeof explicitTruth === "number") {
+    return clamp01(explicitTruth);
+  }
+  return clamp01(toFiniteNumber(row.confidence) ?? 0);
+}
+
+function resolveStoredActivation(
+  row: Record<string, unknown>,
+  activationModelEnabled: boolean,
+): number | null {
+  if (!activationModelEnabled) {
+    return null;
+  }
+  const storedActivation = toFiniteNumber(row.activation_strength);
+  if (typeof storedActivation !== "number" || storedActivation <= 0) {
+    return null;
+  }
+
+  const decayExempt = row.decay_exempt === 1 || row.decay_exempt === "1" || row.decay_exempt === true;
+  if (decayExempt) {
+    return Number(clamp01(storedActivation).toFixed(4));
+  }
+
+  const nowMs = Date.now();
+  const lastReinforcedAtMs = [
+    row.last_reinforced_at,
+    row.last_retrieved_at,
+    row.last_reviewed_at,
+    row.last_seen_at,
+    row.updated_at,
+    row.content_time,
+    row.created_at,
+  ]
+    .map((value) => parseIsoDateMs(value))
+    .find((value) => Number.isFinite(value));
+  const reinforcementCount = Math.max(
+    0,
+    Math.trunc(
+      toFiniteNumber(row.reinforcement_count)
+      ?? toFiniteNumber(row.retrieval_count)
+      ?? toFiniteNumber(row.access_count)
+      ?? 0,
+    ),
+  );
+
+  const projected = computeActivationStrength({
+    activation: clamp01(storedActivation),
+    reinforcementCount,
+    lastReinforcedAtMs: Number.isFinite(lastReinforcedAtMs) ? Number(lastReinforcedAtMs) : nowMs,
+    nowMs,
+  });
+  return Number(projected.toFixed(4));
+}
+
+function resolveActivationFromSignals(row: Record<string, unknown>): number | null {
+  const positiveSignals = ACTIVATION_SIGNAL_COLUMNS
+    .map((column) => toFiniteNumber(row[column]))
+    .filter((value): value is number => typeof value === "number" && value > 0)
+    .map((value) => clamp01(value));
+  if (positiveSignals.length === 0) {
+    return null;
+  }
+  const averageSignal = positiveSignals.reduce((sum, value) => sum + value, 0) / positiveSignals.length;
+  return Number(averageSignal.toFixed(4));
+}
+
+function resolveActivationFromAccessSignals(row: Record<string, unknown>): number | null {
+  const accessCount = toFiniteNumber(row.access_count);
+  if (typeof accessCount !== "number" || accessCount <= 0) {
+    return null;
+  }
+
+  const cappedAccessCount = Math.max(0, Math.min(64, accessCount));
+  const accessStrength = 1 - Math.exp(-cappedAccessCount / 6);
+  const nowMs = Date.now();
+  const accessAnchor = [
+    row.last_accessed_at,
+    row.last_reviewed_at,
+    row.updated_at,
+    row.content_time,
+    row.created_at,
+  ]
+    .map((value) => parseIsoDateMs(value))
+    .find((value) => Number.isFinite(value));
+
+  const recencyFactor = Number.isFinite(accessAnchor)
+    ? Math.max(
+      FALLBACK_ACTIVATION_FLOOR,
+      Math.pow(0.5, Math.max(0, (nowMs - Number(accessAnchor)) / (24 * 60 * 60 * 1000)) / (FALLBACK_ACTIVATION_HALF_LIFE_DAYS * 1.5)),
+    )
+    : 1;
+  return Number(clamp01(Math.max(0.2, accessStrength) * recencyFactor).toFixed(4));
+}
+
+function resolveActivation(
+  row: Record<string, unknown>,
+  activationModelEnabled: boolean,
+): number {
+  const legacyActivation = resolveLegacyActivation(row);
+  if (!activationModelEnabled) {
+    return legacyActivation;
+  }
+  const storedActivation = resolveStoredActivation(row, activationModelEnabled);
+  const explicitActivation = resolveActivationFromSignals(row);
+  const accessActivation = resolveActivationFromAccessSignals(row);
+  const activationSignals = [storedActivation, explicitActivation, accessActivation].filter(
+    (value): value is number => typeof value === "number" && value > 0,
+  );
+  if (activationSignals.length === 0) {
+    return legacyActivation;
+  }
+  const explicitAverage = activationSignals.reduce((sum, value) => sum + value, 0) / activationSignals.length;
+  const blendedActivation = clamp01(explicitAverage * 0.72 + legacyActivation * 0.28);
+  if (blendedActivation <= 0) {
+    return legacyActivation;
+  }
+  return Number(blendedActivation.toFixed(4));
 }
 
 function scoreCandidate(
@@ -514,14 +736,20 @@ function scoreCandidate(
   query: string,
   queryTokens: string[],
   entityTerms: string[],
+  config?: LcmConfig,
   vectorSimilarity = 0,
 ): MemoryRecallCandidate {
   const content = String(row.content || "");
   const tags = parseJsonArray(row.tags);
   const combined = `${content}\n${tags.join(" ")}`.toLowerCase();
-  const confidence = Math.max(0, Math.min(1, Number(row.confidence || 0)));
-  const effectiveConfidence = resolveEffectiveConfidence(row);
-  const valueScore = Math.max(0, Math.min(1, Number(row.value_score || 0)));
+  const activationModelEnabled = isActivationModelEnabledForSeed(
+    config,
+    String(row.memory_id || query || "global"),
+  );
+  const confidence = resolveTruthConfidence(row, activationModelEnabled);
+  const activation = resolveActivation(row, activationModelEnabled);
+  const effectiveConfidence = Number((confidence * activation).toFixed(4));
+  const valueScore = clamp01(toFiniteNumber(row.value_score) ?? 0);
   const queryLower = query.toLowerCase();
   const vector = Math.max(0, vectorSimilarity) * 0.28;
 
@@ -539,10 +767,11 @@ function scoreCandidate(
   }
 
   const temporal = row.content_time ? 0.05 : 0;
+  const confidenceContribution = confidence * CONFIDENCE_SCORE_WEIGHT * activation;
 
   const rawScore =
-    effectiveConfidence * 0.5
-    + valueScore * 0.18
+    confidenceContribution
+    + valueScore * VALUE_SCORE_WEIGHT
     + lexical
     + vector
     + temporal
@@ -561,8 +790,9 @@ function scoreCandidate(
   const score = rawScore * typeMultiplier;
 
   const scoreBreakdown = {
-    confidence: effectiveConfidence * 0.5,
-    value: valueScore * 0.18,
+    confidence: confidence * CONFIDENCE_SCORE_WEIGHT,
+    activation,
+    value: valueScore * VALUE_SCORE_WEIGHT,
     lexical: lexical,
     vector,
     temporal,
@@ -576,6 +806,7 @@ function scoreCandidate(
     content,
     scope: String(row.scope || "shared"),
     confidence,
+    activation,
     effectiveConfidence,
     valueScore,
     tags,
@@ -658,11 +889,12 @@ export async function fetchMemoryCandidates(
         options.query,
         queryTokens,
         entityLockTerms,
+        options.config,
         vectorSimilarities.get(String(row.memory_id || "")) || 0,
       ),
     )
     .filter((row) => row.score >= options.minScore)
-    .sort((a, b) => b.score - a.score || b.confidence - a.confidence || b.createdAt.localeCompare(a.createdAt));
+    .sort((a, b) => b.score - a.score || b.effectiveConfidence - a.effectiveConfidence || b.createdAt.localeCompare(a.createdAt));
 
   const memories: MemoryRecallCandidate[] = [];
   let totalTokens = 0;

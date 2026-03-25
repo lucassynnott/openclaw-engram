@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
+import { hashNormalized, normalizeContent } from "../src/memory/memory-utils.js";
 import { createMemoryAddTool } from "../src/surface/memory-add-tool.js";
 import {
   createEntityGetTool,
@@ -217,6 +218,103 @@ describe("engram v2 compatibility tools", () => {
     expect(result.details.lcm.summaries).toBeGreaterThan(0);
     expect(result.details.world_model.links).toBeGreaterThanOrEqual(0);
     expect(result.details.alignment.status).toBe("active");
+  });
+
+  it("ops_status exposes activation rollout observability counters", async () => {
+    config.activationModelEnabled = true;
+    config.activationModelRolloutFraction = 1;
+    config.hygieneTieringEnabled = true;
+    config.hygieneTieringMode = "observe";
+
+    const addTool = createMemoryAddTool({ config });
+    const addResult = await addTool.execute("t_ops_obs_1", {
+      content: "Engram keeps explicit rollout checklists before every deploy.",
+      kind: "DECISION",
+    });
+    await addTool.execute("t_ops_obs_2", {
+      content: "Engram keeps explicit rollout checklists before every deploy.",
+      kind: "DECISION",
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    db.prepare(`
+      UPDATE memory_current
+      SET retrieval_count = 1,
+          reinforcement_count = 2,
+          activation_strength = 0.88,
+          truth_confidence = COALESCE(truth_confidence, confidence),
+          last_reinforced_at = ?,
+          last_retrieved_at = ?
+      WHERE memory_id = ?
+    `).run(
+      "2026-03-20T12:00:00.000Z",
+      "2026-03-21T09:30:00.000Z",
+      addResult.details.memoryId,
+    );
+
+    db.prepare(`
+      INSERT INTO memory_events (event_id, timestamp, component, action, memory_id, source, payload)
+      VALUES (?, ?, 'memory_search', 'reinforce_search', ?, 'system', ?)
+    `).run(
+      "evt_ops_search",
+      "2026-03-21T09:30:00.000Z",
+      addResult.details.memoryId,
+      JSON.stringify({ query: "rollout checklist" }),
+    );
+
+    const coldCandidateContent = "January checkpoint: reviewed a minor note about backlog triage.";
+    db.prepare(`
+      INSERT INTO memory_current (
+        memory_id, type, content, normalized, normalized_hash,
+        source, confidence, truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+        last_reinforced_at, last_retrieved_at, decay_exempt, scope, status, value_score, value_label,
+        created_at, updated_at, archived_at, tags, superseded_by,
+        content_time, source_layer, source_path, source_line, last_reviewed_at
+      ) VALUES (?, 'EPISODE', ?, ?, ?, 'manual', 0.42, 0.42, 0.08, 0, 0, NULL, NULL, 0, 'shared', 'active', 0.2, 'archive_candidate', ?, ?, NULL, '[]', NULL, ?, 'registry', NULL, NULL, NULL)
+    `).run(
+      "mem_ops_cold_candidate",
+      coldCandidateContent,
+      normalizeContent(coldCandidateContent),
+      hashNormalized(coldCandidateContent),
+      "2026-01-10T10:00:00.000Z",
+      "2026-01-10T10:00:00.000Z",
+      "2026-01-10",
+    );
+
+    const archivedEpisodeContent = "February checkpoint: archived deployment housekeeping note.";
+    db.prepare(`
+      INSERT INTO memory_current (
+        memory_id, type, content, normalized, normalized_hash,
+        source, confidence, truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+        last_reinforced_at, last_retrieved_at, decay_exempt, scope, status, value_score, value_label,
+        created_at, updated_at, archived_at, tags, superseded_by,
+        content_time, source_layer, source_path, source_line, last_reviewed_at
+      ) VALUES (?, 'EPISODE', ?, ?, ?, 'manual', 0.38, 0.38, 0.04, 0, 0, NULL, NULL, 0, 'shared', 'archived', 0.18, 'archive_candidate', ?, ?, ?, '[]', NULL, ?, 'registry', NULL, NULL, NULL)
+    `).run(
+      "mem_ops_cold_archived",
+      archivedEpisodeContent,
+      normalizeContent(archivedEpisodeContent),
+      hashNormalized(archivedEpisodeContent),
+      "2026-02-01T09:00:00.000Z",
+      "2026-02-01T09:00:00.000Z",
+      "2026-03-01T09:00:00.000Z",
+      "2026-02-01",
+    );
+
+    const tool = createOpsStatusTool({ config });
+    const result = await tool.execute("t_ops_obs_3", {});
+    const activation = result.details.memory.activation_model as Record<string, unknown>;
+
+    expect(activation.enabled).toBe(true);
+    expect(activation.rollout_fraction).toBe(1);
+    expect(activation.hygiene_tiering_mode).toBe("observe");
+    expect(Number(activation.reinforce_capture_events)).toBeGreaterThanOrEqual(1);
+    expect(Number(activation.reinforce_search_events)).toBe(1);
+    expect(Number(activation.total_reinforcement_events)).toBeGreaterThanOrEqual(2);
+    expect(Number(activation.duplicate_to_reinforce_ratio)).toBeGreaterThan(0);
+    expect(Number(activation.retrieved_memories)).toBeGreaterThanOrEqual(1);
+    expect(Number(activation.cold_tier_candidate_episodes)).toBeGreaterThanOrEqual(1);
+    expect(Number(activation.cold_tier_archived_episodes)).toBeGreaterThanOrEqual(1);
   });
 
   it("gradient_score exposes the alignment compatibility surface", async () => {

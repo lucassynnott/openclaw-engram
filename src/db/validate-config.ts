@@ -48,6 +48,24 @@ export function validateConfig(
     );
   }
 
+  if (
+    typeof config.activationModelRolloutFraction === "number" &&
+    (config.activationModelRolloutFraction < 0 || config.activationModelRolloutFraction > 1)
+  ) {
+    log.warn(
+      `[engram] config: activationModelRolloutFraction (${config.activationModelRolloutFraction}) must be between 0 and 1, using default 0`,
+    );
+  }
+
+  if (typeof config.hygieneTieringMode === "string") {
+    const mode = config.hygieneTieringMode.trim().toLowerCase();
+    if (mode && mode !== "off" && mode !== "observe" && mode !== "enforce") {
+      log.warn(
+        `[engram] config: hygieneTieringMode (${config.hygieneTieringMode}) should be one of off|observe|enforce, using default observe`,
+      );
+    }
+  }
+
   if (config.vaultSyncIntervalHours < 0) {
     log.warn(
       `[engram] config: vaultSyncIntervalHours (${config.vaultSyncIntervalHours}) must be >= 0, using default 24`,

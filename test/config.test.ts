@@ -17,6 +17,10 @@ describe("resolveLcmConfig", () => {
     expect(config.condensedMinFanoutHard).toBe(2);
     expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
+    expect(config.activationModelEnabled).toBe(false);
+    expect(config.activationModelRolloutFraction).toBe(0);
+    expect(config.hygieneTieringEnabled).toBe(false);
+    expect(config.hygieneTieringMode).toBe("observe");
   });
 
   it("reads values from plugin config", () => {
@@ -155,6 +159,22 @@ describe("resolveLcmConfig", () => {
       largeFileThresholdTokens: 12345,
     });
     expect(config.largeFileTokenThreshold).toBe(12345);
+  });
+
+  it("reads activation rollout and hygiene tiering controls", () => {
+    const config = resolveLcmConfig(
+      {
+        ENGRAM_ACTIVATION_MODEL_ENABLED: "true",
+        ENGRAM_ACTIVATION_MODEL_ROLLOUT_FRACTION: "0.35",
+        ENGRAM_HYGIENE_TIERING_ENABLED: "true",
+        ENGRAM_HYGIENE_TIERING_MODE: "enforce",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.activationModelEnabled).toBe(true);
+    expect(config.activationModelRolloutFraction).toBe(0.35);
+    expect(config.hygieneTieringEnabled).toBe(true);
+    expect(config.hygieneTieringMode).toBe("enforce");
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {

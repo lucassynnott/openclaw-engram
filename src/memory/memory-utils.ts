@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export type MemoryKind =
   | "USER_FACT"
+  | "OBSERVATION"
   | "PREFERENCE"
   | "DECISION"
   | "ENTITY"
@@ -11,6 +12,7 @@ export type MemoryKind =
 
 export const VALID_KINDS: MemoryKind[] = [
   "USER_FACT",
+  "OBSERVATION",
   "PREFERENCE",
   "DECISION",
   "ENTITY",
@@ -125,6 +127,8 @@ export const CONTENT_LENGTH_HARD_MAX = 2000;
 
 const TEMPORAL_RE =
   /\b(?:today|tonight|this morning|this afternoon|this evening|yesterday|last night|right now|currently|just now|an hour ago|\d+ (?:minutes?|hours?|days?) ago)\b/i;
+const OBSERVATION_RE =
+  /\b(?:i|we)\s+(?:noticed?|observed?|saw|am seeing|have seen)\b|\b(?:it|this|that)\s+(?:seems?|appears?|looks?)\b|\b(?:seems?|appears?|looks?)\s+to\b|\b(?:likely|probably|possibly)\b/i;
 
 const PREF_RE = /\b(?:user|owner|i)\s+(?:likes?|loves?|prefers?|dislikes?|hates?)\b/i;
 const DECISION_RE = /\b(?:decided|decision|we will|we should|always|agreed to|going with)\b/i;
@@ -215,6 +219,7 @@ export function inferKind(content: string): MemoryKind {
   if (AGENT_RE.test(content)) return "AGENT_IDENTITY";
   if (PREF_RE.test(content)) return "PREFERENCE";
   if (DECISION_RE.test(content)) return "DECISION";
+  if (OBSERVATION_RE.test(content)) return "OBSERVATION";
   if (TEMPORAL_RE.test(content)) return "EPISODE";
   return "USER_FACT";
 }
@@ -232,6 +237,7 @@ function baseTypeScore(type: MemoryKind): number {
     case "AGENT_IDENTITY": return 1.0;
     case "PREFERENCE": return 0.92;
     case "USER_FACT": return 0.9;
+    case "OBSERVATION": return 0.78;
     case "ENTITY": return 0.85;
     case "DECISION": return 0.75;
     case "EPISODE": return 0.68;
@@ -299,6 +305,7 @@ export function classifyValue(content: string, type: MemoryKind, confidence: num
   const isPersonal = PERSONAL_RE.test(text);
   const isRelationship = RELATIONSHIP_RE.test(text);
   const isIdentity = IDENTITY_RE.test(text) || type === "AGENT_IDENTITY";
+  const observationPenalty = type === "OBSERVATION" ? 0.08 : 0;
   const operationalNoise = clamp01(OPS_NOISE_RE.test(text) ? 0.75 : 0);
   const distinctTokens = new Set(normalizeContent(text).split(/\s+/).filter(Boolean)).size;
   const specificity = clamp01(Math.min(distinctTokens, 24) / 24 + (/[0-9]/.test(text) ? 0.1 : 0));
@@ -317,6 +324,7 @@ export function classifyValue(content: string, type: MemoryKind, confidence: num
     clamp01(typeScore * 0.65 + confidence * 0.35) * 0.2 +
     0.8 * 0.08 +
     specificity * 0.08 -
+    observationPenalty -
     operationalNoise * 0.15 -
     lengthPenalty,
   );
@@ -352,7 +360,7 @@ export function classifyValue(content: string, type: MemoryKind, confidence: num
       action: "keep",
       value_label: "situational",
       value_score: adjustedScore,
-      reason_codes: ["manual_add_bias"],
+      reason_codes: [type === "OBSERVATION" ? "observational_signal" : "manual_add_bias"],
     };
   }
   return {

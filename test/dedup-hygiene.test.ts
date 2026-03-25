@@ -3,7 +3,7 @@
  *
  * Validates that:
  * - Near-duplicate heartbeat EPISODEs are detected and archived
- * - Episode retention archives old entries
+ * - Stale heartbeat/status-spam episode archival is enforced
  * - Fragment memories are correctly identified
  * - The isHeartbeatPattern function catches known patterns
  * - The isFragmentContent function identifies short/label-like content
@@ -158,20 +158,20 @@ describe("isFragmentContent", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Episode retention — archiveStaleEpisodes
+// Backward-compatible stale episode archival (heartbeat/status-spam only)
 // ---------------------------------------------------------------------------
 
 describe("archiveStaleEpisodes", () => {
-  it("archives EPISODE entries older than retentionDays", () => {
+  it("archives stale heartbeat/status-spam EPISODE entries", () => {
     const { db } = makeDb();
     ensureMemoryTables(db);
 
-    // Insert an old episode (30 days ago)
+    // Insert an old heartbeat episode (30 days ago)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     insertMemory(db, {
       memoryId: "mem_old_ep",
       type: "EPISODE",
-      content: "Lucas deployed the gateway thirty days ago and it worked fine",
+      content: "HEARTBEAT_OK: no issues found, status unchanged since prior check",
       createdAt: thirtyDaysAgo,
       contentTime: thirtyDaysAgo,
     });

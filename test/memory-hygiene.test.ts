@@ -3,6 +3,7 @@ import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { ensureMemoryTables } from "../src/memory/memory-schema.js";
 import {
+  archiveColdTierEpisodes,
   archiveFragments,
   archiveStaleEpisodes,
   archiveStaleHeartbeats,
@@ -55,6 +56,8 @@ function insertMemoryDirect(params: {
   status?: string;
   createdAt?: string;
   contentTime?: string;
+  valueScore?: number | null;
+  lastReviewedAt?: string | null;
 }): void {
   const db = getLcmConnection(params.config.databasePath);
   ensureMemoryTables(db);
@@ -63,13 +66,16 @@ function insertMemoryDirect(params: {
     INSERT INTO memory_current (
       memory_id, type, content, normalized, normalized_hash,
       source, confidence, scope, status,
+      value_score, last_reviewed_at,
       created_at, updated_at, content_time, source_layer
-    ) VALUES (?, ?, ?, '', '', 'test', 0.75, 'shared', ?, ?, ?, ?, 'registry')
+    ) VALUES (?, ?, ?, '', '', 'test', 0.75, 'shared', ?, ?, ?, ?, ?, ?, 'registry')
   `).run(
     params.memoryId,
     params.type,
     params.content,
     params.status ?? "active",
+    params.valueScore ?? null,
+    params.lastReviewedAt ?? null,
     params.createdAt ?? now,
     now,
     params.contentTime ?? params.createdAt ?? now,
@@ -256,6 +262,111 @@ describe("archiveStaleHeartbeats", () => {
   });
 });
 
+describe("archiveColdTierEpisodes", () => {
+  let config: LcmConfig;
+
+  beforeEach(() => {
+    config = makeConfig();
+  });
+
+  afterEach(() => {
+    closeLcmConnection();
+  });
+
+  it("archives only low-activation low-value non-heartbeat episodes", () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_cold_candidate",
+      type: "EPISODE",
+      content: "Paired with teammate to run a small migration checklist and notes",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.2,
+    });
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_cold_high_value",
+      type: "EPISODE",
+      content: "Shipped high-impact production fix with rollout plan and validation",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.8,
+    });
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_cold_heartbeat",
+      type: "EPISODE",
+      content: "HEARTBEAT_OK: all systems nominal, no blockers found",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.1,
+    });
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_cold_reviewed",
+      type: "EPISODE",
+      content: "Tracked a small status check from previous sprint handoff",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.2,
+      lastReviewedAt: now,
+    });
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_cold_activated",
+      type: "EPISODE",
+      content: "Captured an old task update for reference",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.2,
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    db.prepare(`
+      INSERT INTO memory_events (event_id, timestamp, component, action, memory_id, source, payload)
+      VALUES (?, ?, 'test', 'recall', ?, 'test', '{}')
+    `).run("evt_cold_activation", now, "mem_cold_activated");
+
+    const result = archiveColdTierEpisodes({
+      db,
+      retentionDays: 7,
+      maxValueScore: 0.35,
+      maxActivationEvents: 0,
+      requireUnreviewed: true,
+    });
+
+    expect(result.archived).toBe(1);
+
+    const candidate = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_cold_candidate") as { status: string };
+    expect(candidate.status).toBe("archived");
+
+    const highValue = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_cold_high_value") as { status: string };
+    expect(highValue.status).toBe("active");
+
+    const heartbeat = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_cold_heartbeat") as { status: string };
+    expect(heartbeat.status).toBe("active");
+
+    const reviewed = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_cold_reviewed") as { status: string };
+    expect(reviewed.status).toBe("active");
+
+    const activated = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_cold_activated") as { status: string };
+    expect(activated.status).toBe("active");
+  });
+});
+
 describe("archiveFragments", () => {
   let config: LcmConfig;
 
@@ -351,6 +462,8 @@ describe("runMemoryHygiene", () => {
     const result = runMemoryHygiene({ db, config });
 
     expect(result.staleEpisodes.archived).toBe(1);
+    expect(result.staleHeartbeats.archived).toBe(1);
+    expect(result.coldTierEpisodes.archived).toBe(0);
     expect(result.fragments.archived).toBe(1);
 
     // Verify states
@@ -369,13 +482,143 @@ describe("runMemoryHygiene", () => {
       .get("mem_hyg_good_01") as { status: string };
     expect(good.status).toBe("active");
   });
+
+  it("keeps cold-tier archival disabled by default", () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_hyg_cold_off",
+      type: "EPISODE",
+      content: "Captured a low-value old update from a previous checklist",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.15,
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const result = runMemoryHygiene({ db, config });
+
+    expect(result.coldTierEpisodes.archived).toBe(0);
+
+    const row = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_hyg_cold_off") as { status: string };
+    expect(row.status).toBe("active");
+  });
+
+  it("can enable cold-tier archival via runtime config fields", () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_hyg_cold_on",
+      type: "EPISODE",
+      content: "Captured a low-value old update from a previous checklist",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.15,
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const runtimeConfig = {
+      ...config,
+      coldTierEnabled: true,
+      coldTierRetentionDays: 7,
+      coldTierMaxValueScore: 0.35,
+      coldTierMaxActivationEvents: 0,
+    } as LcmConfig;
+
+    const result = runMemoryHygiene({ db, config: runtimeConfig });
+
+    expect(result.staleHeartbeats.archived).toBe(0);
+    expect(result.coldTierEpisodes.archived).toBe(1);
+    expect(result.staleEpisodes.archived).toBe(1);
+
+    const row = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_hyg_cold_on") as { status: string };
+    expect(row.status).toBe("archived");
+  });
+
+  it("supports hygiene tiering rollout flags in enforce mode", () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_hyg_tiering_enforce",
+      type: "EPISODE",
+      content: "Captured a low-value old update from a previous checklist",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.15,
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const rolloutConfig = {
+      ...makeConfig({
+        hygieneTieringEnabled: true,
+        hygieneTieringMode: "enforce",
+      }),
+      hygieneTieringEnabled: true,
+      hygieneTieringMode: "enforce",
+      coldTierRetentionDays: 7,
+      coldTierMaxValueScore: 0.35,
+      coldTierMaxActivationEvents: 0,
+    } as LcmConfig;
+    const result = runMemoryHygiene({ db, config: rolloutConfig });
+
+    expect(result.coldTierEpisodes.archived).toBe(1);
+    const row = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_hyg_tiering_enforce") as { status: string };
+    expect(row.status).toBe("archived");
+  });
+
+  it("supports hygiene tiering rollout flags in observe mode without archiving", () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+    insertMemoryDirect({
+      config,
+      memoryId: "mem_hyg_tiering_observe",
+      type: "EPISODE",
+      content: "Captured a low-value old update from a previous checklist",
+      createdAt: tenDaysAgo,
+      contentTime: tenDaysAgo,
+      valueScore: 0.15,
+    });
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const rolloutConfig = {
+      ...makeConfig({
+        hygieneTieringEnabled: true,
+        hygieneTieringMode: "observe",
+      }),
+      hygieneTieringEnabled: true,
+      hygieneTieringMode: "observe",
+      coldTierRetentionDays: 7,
+      coldTierMaxValueScore: 0.35,
+      coldTierMaxActivationEvents: 0,
+    } as LcmConfig;
+    const result = runMemoryHygiene({ db, config: rolloutConfig });
+
+    expect(result.coldTierEpisodes.archived).toBe(0);
+    const row = db
+      .prepare("SELECT status FROM memory_current WHERE memory_id = ?")
+      .get("mem_hyg_tiering_observe") as { status: string };
+    expect(row.status).toBe("active");
+  });
 });
 
 describe("heartbeat dedupe threshold", () => {
   let config: LcmConfig;
 
   beforeEach(() => {
-    config = makeConfig({ heartbeatDedupeThreshold: 0.7 });
+    config = makeConfig({
+      heartbeatDedupeThreshold: 0.7,
+      activationModelEnabled: true,
+      activationModelRolloutFraction: 1,
+    });
   });
 
   afterEach(() => {
@@ -402,8 +645,21 @@ describe("heartbeat dedupe threshold", () => {
       source: "test",
       component: "test",
     });
-    expect(r2.stored).toBe(false);
-    expect(r2.reason).toBe("duplicate_semantic");
+    expect(r2.stored).toBe(true);
+    expect(r2.reinforced).toBe(true);
+    expect(r2.memoryId).toBe(r1.memoryId);
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const row = db
+      .prepare(`
+        SELECT COUNT(*) AS c, MAX(reinforcement_count) AS reinforcement_count
+        FROM memory_current
+        WHERE type = 'EPISODE'
+          AND content LIKE ?
+      `)
+      .get("%Heartbeat recheck%") as Record<string, unknown>;
+    expect(Number(row.c)).toBe(1);
+    expect(Number(row.reinforcement_count)).toBeGreaterThan(1);
   });
 
   it("does not over-dedupe distinct episode content", () => {

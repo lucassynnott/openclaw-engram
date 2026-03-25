@@ -82,6 +82,10 @@ export type LcmConfig = {
   episodeRetentionDays: number;
   heartbeatDedupeThreshold: number;
   fragmentMinContentChars: number;
+  activationModelEnabled?: boolean;
+  activationModelRolloutFraction?: number;
+  hygieneTieringEnabled?: boolean;
+  hygieneTieringMode?: string;
   harvestEnabled: boolean;
   harvestEveryNTurns: number;
   harvestLookbackTurns: number;
@@ -764,6 +768,34 @@ export function resolveLcmConfig(
       ["ENGRAM_FRAGMENT_MIN_CONTENT_CHARS"],
       ["hygiene.fragmentMinContentChars", "fragmentMinContentChars"],
       50,
+    ),
+    activationModelEnabled: readBool(
+      env,
+      pc,
+      ["ENGRAM_ACTIVATION_MODEL_ENABLED", "LCM_ACTIVATION_MODEL_ENABLED"],
+      ["activationModel.enabled", "activation.enabled", "activationModelEnabled"],
+      false,
+    ),
+    activationModelRolloutFraction: readNumber(
+      env,
+      pc,
+      ["ENGRAM_ACTIVATION_MODEL_ROLLOUT_FRACTION", "LCM_ACTIVATION_MODEL_ROLLOUT_FRACTION"],
+      ["activationModel.rolloutFraction", "activation.rolloutFraction", "activationModelRolloutFraction"],
+      0,
+    ),
+    hygieneTieringEnabled: readBool(
+      env,
+      pc,
+      ["ENGRAM_HYGIENE_TIERING_ENABLED", "LCM_HYGIENE_TIERING_ENABLED"],
+      ["hygiene.tieringEnabled", "hygieneTieringEnabled"],
+      false,
+    ),
+    hygieneTieringMode: readString(
+      env,
+      pc,
+      ["ENGRAM_HYGIENE_TIERING_MODE", "LCM_HYGIENE_TIERING_MODE"],
+      ["hygiene.tieringMode", "hygieneTieringMode"],
+      "observe",
     ),
     harvestEnabled: readBool(
       env,

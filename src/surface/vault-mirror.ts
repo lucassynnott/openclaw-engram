@@ -277,6 +277,14 @@ const wikiLink = (relPath: string, label = ""): string => {
   return `[[${notePath}|${label}]]`;
 };
 
+const shouldSurfaceConversation = (
+  summaries: SummaryRow[],
+  mode: string,
+): boolean => {
+  if (mode === "diagnostic") return summaries.length > 0;
+  return summaries.some((summary) => summary.kind === "condensed");
+};
+
 const yamlScalar = (value: unknown): string => {
   if (value === null || value === undefined || value === "") return "null";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -1358,10 +1366,16 @@ export const buildVaultSurface = ({
       list.push(s);
       summariesByConversation.set(s.conversation_id, list);
     }
+    const surfacedConversations = conversations.filter((conv) =>
+      shouldSurfaceConversation(
+        summariesByConversation.get(conv.conversation_id) ?? [],
+        mode,
+      ),
+    );
 
     // Build agent groups from session keys
     const agentGroups = new Map<string, AgentData>();
-    for (const conv of conversations) {
+    for (const conv of surfacedConversations) {
       const agentId = parseAgentId(conv.session_id);
       if (!agentId) continue;
       const existing = agentGroups.get(agentId) ?? {
@@ -1403,7 +1417,7 @@ export const buildVaultSurface = ({
         generatedAt,
         vaultRoot,
         subdir,
-        conversationCount: conversations.length,
+        conversationCount: surfacedConversations.length,
         agentCount: agentGroups.size,
         summaryCount: allSummaries.length,
         leafCount,
@@ -1418,9 +1432,8 @@ export const buildVaultSurface = ({
     );
 
     // Session notes — only write if the conversation has at least one summary
-    for (const conv of conversations) {
+    for (const conv of surfacedConversations) {
       const convSummaries = summariesByConversation.get(conv.conversation_id) ?? [];
-      if (convSummaries.filter((s) => s.kind === "condensed").length === 0) continue; // skip stubs with no condensed summaries
       const agentId = parseAgentId(conv.session_id);
       writeManagedText(
         writer,
@@ -1436,7 +1449,7 @@ export const buildVaultSurface = ({
 
     // Views (context)
     for (const viewFile of buildViewFiles({
-      conversations,
+      conversations: surfacedConversations,
       agentGroups,
       summaries: allSummaries,
       generatedAt,
@@ -1498,7 +1511,7 @@ export const buildVaultSurface = ({
       mirror_root: mirrorRoot,
       generated_files: [],
       manual_folders: manualFolders,
-      conversation_count: conversations.length,
+      conversation_count: surfacedConversations.length,
       summary_count: allSummaries.length,
     };
 
@@ -1531,7 +1544,7 @@ export const buildVaultSurface = ({
       renderVaultIndex({
         generatedAt,
         homeNoteRelPath: homeNotePath(config.vaultHomeNoteName || "Home"),
-        conversationCount: conversations.length,
+        conversationCount: surfacedConversations.length,
         generatedFilesCount: writer.generatedFiles.size,
       }),
     );
@@ -1546,7 +1559,7 @@ export const buildVaultSurface = ({
       vault_root: vaultRoot,
       subdir,
       mirror_root: mirrorRoot,
-      conversation_count: conversations.length,
+      conversation_count: surfacedConversations.length,
       agent_count: agentGroups.size,
       summary_count: allSummaries.length,
       leaf_summary_count: leafCount,

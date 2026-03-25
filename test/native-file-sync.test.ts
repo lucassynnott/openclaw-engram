@@ -108,6 +108,22 @@ describe("native file sync layer", () => {
     expect(rows.some((row) => row.source_layer === "native" && row.source_path === "MEMORY.md")).toBe(true);
     expect(rows.some((row) => row.source_layer === "native" && row.source_path === "memory/2026-03-18.md")).toBe(true);
     expect(rows.some((row) => row.source_layer === "promoted_native" && row.source_path === "life/areas/engram/items.yaml")).toBe(true);
+
+    const seedRow = db
+      .prepare(`
+        SELECT truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+               last_reinforced_at, last_retrieved_at, decay_exempt
+        FROM memory_current
+        WHERE memory_id = ?
+      `)
+      .get("mem_native_seed") as Record<string, unknown> | undefined;
+    expect(Number(seedRow?.truth_confidence)).toBeCloseTo(0.82, 4);
+    expect(Number(seedRow?.activation_strength)).toBe(0);
+    expect(Number(seedRow?.reinforcement_count)).toBe(0);
+    expect(Number(seedRow?.retrieval_count)).toBe(0);
+    expect(seedRow?.last_reinforced_at).toBe("2026-03-17");
+    expect(seedRow?.last_retrieved_at).toBe("2026-03-17");
+    expect(Number(seedRow?.decay_exempt)).toBe(0);
   });
 
   it("keeps registry rows authoritative when a native file repeats the same fact", () => {
@@ -169,8 +185,86 @@ describe("native file sync layer", () => {
     expect(secondSync.filesWritten).toBe(0);
     expect(sync.paraFolderCount).toBe(1);
     expect(paraItemsPath).toBeTruthy();
-    expect(readFileSync(String(paraItemsPath), "utf8")).toContain("We will keep native sync local to the repo");
+    const paraItems = readFileSync(String(paraItemsPath), "utf8");
+    expect(paraItems).toContain("We will keep native sync local to the repo");
+    expect(paraItems).toContain("truth_confidence:");
+    expect(paraItems).toContain("activation_strength:");
+    expect(paraItems).toContain("reinforcement_count:");
+    expect(paraItems).toContain("retrieval_count:");
+    expect(paraItems).toContain("last_reinforced_at:");
+    expect(paraItems).toContain("last_retrieved_at:");
     expect(readFileSync(join(dir, "MEMORY.md"), "utf8")).toContain("<!-- engram:sync:start -->");
+  });
+
+  it("round-trips lifecycle metadata through items.yaml sync and reindex", () => {
+    const { db: sourceDb, dir } = makeDb();
+    const { db: importedDb } = makeDb();
+    ensureMemoryTables(sourceDb);
+    ensureMemoryTables(importedDb);
+
+    const content = "Lucas keeps lifecycle metadata in sync with the exported PARA mirror";
+    sourceDb
+      .prepare(`
+        INSERT INTO memory_current (
+          memory_id, type, content, normalized, normalized_hash,
+          source, confidence, truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+          last_reinforced_at, last_retrieved_at, decay_exempt, scope, status, value_score, value_label,
+          created_at, updated_at, archived_at, tags, superseded_by,
+          content_time, source_layer, source_path, source_line
+        ) VALUES (?, 'PREFERENCE', ?, ?, ?, 'native_file', 0.74, 0.91, 0.63, 4, 7, ?, ?, 1, 'shared', 'active', 0.88, 'core', ?, ?, NULL, '["projects/engram"]', NULL, ?, 'promoted_native', 'life/areas/engram/items.yaml', 1)
+      `)
+      .run(
+        "mem_lifecycle_roundtrip",
+        content,
+        normalizeContent(content),
+        hashNormalized(content),
+        "2026-03-17T08:00:00.000Z",
+        "2026-03-18T09:15:00.000Z",
+        "2026-03-17T08:00:00.000Z",
+        "2026-03-18T09:15:00.000Z",
+        "2026-03-17",
+      );
+
+    const sync = syncNativeMemoryLayer({ db: sourceDb, rootDir: dir });
+    const paraItemsPath = listFiles(join(dir, "life")).find((filePath) => filePath.endsWith("items.yaml"));
+    expect(sync.filesWritten).toBeGreaterThan(0);
+    expect(paraItemsPath).toBeTruthy();
+
+    const paraItems = readFileSync(String(paraItemsPath), "utf8");
+    expect(paraItems).toContain("truth_confidence: 0.91");
+    expect(paraItems).toContain("activation_strength: 0.63");
+    expect(paraItems).toContain("reinforcement_count: 4");
+    expect(paraItems).toContain("retrieval_count: 7");
+    expect(paraItems).toContain("last_reinforced_at: \"2026-03-17T08:00:00.000Z\"");
+    expect(paraItems).toContain("last_retrieved_at: \"2026-03-18T09:15:00.000Z\"");
+    expect(paraItems).toContain("decay_exempt: 1");
+
+    const reindex = reindexNativeMemoryLayer({
+      db: importedDb,
+      rootDir: dir,
+      now: "2026-03-18T10:00:00.000Z",
+    });
+
+    expect(reindex.imported).toBe(1);
+    expect(reindex.conflicts).toBe(0);
+
+    const importedRow = importedDb
+      .prepare(`
+        SELECT truth_confidence, activation_strength, reinforcement_count, retrieval_count,
+               last_reinforced_at, last_retrieved_at, decay_exempt, source_layer, source_path
+        FROM memory_current
+        WHERE memory_id = ?
+      `)
+      .get("mem_lifecycle_roundtrip") as Record<string, unknown> | undefined;
+    expect(Number(importedRow?.truth_confidence)).toBeCloseTo(0.91, 4);
+    expect(Number(importedRow?.activation_strength)).toBeCloseTo(0.63, 4);
+    expect(Number(importedRow?.reinforcement_count)).toBe(4);
+    expect(Number(importedRow?.retrieval_count)).toBe(7);
+    expect(importedRow?.last_reinforced_at).toBe("2026-03-17T08:00:00.000Z");
+    expect(importedRow?.last_retrieved_at).toBe("2026-03-18T09:15:00.000Z");
+    expect(Number(importedRow?.decay_exempt)).toBe(1);
+    expect(importedRow?.source_layer).toBe("promoted_native");
+    expect(importedRow?.source_path).toBe("life/areas/projects-engram/items.yaml");
   });
 
   it("reindexs synced registry mirrors without false conflicts", () => {

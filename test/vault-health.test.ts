@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -115,6 +115,69 @@ describe("vault health reporting", () => {
     expect(health.vault.generated_files).toBeGreaterThan(0);
     expect(health.vault.merge_suggestions?.count).toBeGreaterThan(0);
     expect(report).toContain("Entity Merge Suggestions");
+  });
+
+  it("only surfaces conversations that can render session notes", () => {
+    const config = makeConfig({ obsidianMode: "diagnostic" });
+    dbPaths.add(config.databasePath);
+    const db = getLcmConnection(config.databasePath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        conversation_id INTEGER PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        bootstrapped_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summaries (
+        summary_id TEXT PRIMARY KEY,
+        conversation_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        depth INTEGER NOT NULL DEFAULT 0,
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        earliest_at TEXT,
+        latest_at TEXT,
+        descendant_count INTEGER NOT NULL DEFAULT 0,
+        descendant_token_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        file_ids TEXT NOT NULL DEFAULT '[]'
+      );
+    `);
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, title, created_at, updated_at)
+       VALUES
+       (1, 'agent:main:leaf-session', 'Leaf Session', datetime('now'), datetime('now')),
+       (2, 'agent:main:empty-session', 'Empty Session', datetime('now'), datetime('now'))`,
+    ).run();
+    db.prepare(
+      `INSERT INTO summaries (
+         summary_id, conversation_id, kind, depth, content, token_count,
+         earliest_at, latest_at, descendant_count, descendant_token_count, created_at, file_ids
+       )
+       VALUES (
+         'sum_leaf', 1, 'leaf', 0, 'Leaf-only summary', 42,
+         datetime('now'), datetime('now'), 0, 0, datetime('now'), '[]'
+       )`,
+    ).run();
+
+    const summary = buildVaultSurface({ db, config });
+    const leafSessionPath = join(summary.mirror_root, "10 Sessions", "agent_main_leaf-session.md");
+    const emptySessionPath = join(summary.mirror_root, "10 Sessions", "agent_main_empty-session.md");
+    const agentNotePath = join(summary.mirror_root, "20 Agents", "main.md");
+    const recentSessionsPath = join(summary.mirror_root, "30 Views", "Recent Sessions.md");
+
+    expect(summary.conversation_count).toBe(1);
+    expect(existsSync(leafSessionPath)).toBe(true);
+    expect(existsSync(emptySessionPath)).toBe(false);
+
+    const agentNote = readFileSync(agentNotePath, "utf8");
+    const recentSessions = readFileSync(recentSessionsPath, "utf8");
+    expect(agentNote).toContain("Leaf Session");
+    expect(agentNote).not.toContain("Empty Session");
+    expect(recentSessions).toContain("Leaf Session");
+    expect(recentSessions).not.toContain("Empty Session");
   });
 
   it("rejects recursive vault roots that would create Engram/Engram nesting", () => {

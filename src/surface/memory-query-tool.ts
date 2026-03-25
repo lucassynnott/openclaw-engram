@@ -3,6 +3,9 @@ import type { DatabaseSync } from "node:sqlite";
 import type { LcmConfig } from "../db/config.js";
 import { getLcmConnection } from "../db/connection.js";
 import { ensureWorldModelReady, findEntityMatches, getEntityDetail } from "../entity/world-model.js";
+import { applyActivationEvent } from "../memory/activation.js";
+import { isActivationModelEnabledForSeed } from "../memory/activation-rollout.js";
+import { ensureMemoryTables } from "../memory/memory-schema.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { fetchMemoryCandidates } from "./memory-recall-core.js";
@@ -10,6 +13,19 @@ import { fetchMemoryCandidates } from "./memory-recall-core.js";
 const DEFAULT_RECALL_TOP_K = 8;
 const DEFAULT_RECALL_MIN_SCORE = 0.45;
 const DEFAULT_RECALL_MAX_TOKENS = 1200;
+
+type ReinforceableMemoryRow = {
+  memory_id: string;
+  confidence: number | null;
+  truth_confidence: number | null;
+  value_score: number | null;
+  activation_strength: number | null;
+  reinforcement_count: number | null;
+  last_reinforced_at: string | null;
+  last_retrieved_at: string | null;
+  updated_at: string | null;
+  created_at: string | null;
+};
 
 const MemoryQuerySchema = Type.Object({
   query: Type.String({
@@ -92,6 +108,108 @@ function truncateInlineText(value: unknown, maxChars: number): string {
   if (!text) return "";
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function parseIsoDateMs(value: unknown, fallbackMs: number): number {
+  const parsed = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : fallbackMs;
+}
+
+function reinforceReturnedMemories(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+  memoryIds: string[];
+  query: string;
+  strategy: string;
+}): void {
+  ensureMemoryTables(params.db);
+  const now = new Date().toISOString();
+  const nowMs = Date.parse(now);
+  const uniqueIds = [...new Set(params.memoryIds.map((id) => String(id).trim()).filter(Boolean))];
+
+  for (const memoryId of uniqueIds) {
+    if (!isActivationModelEnabledForSeed(params.config, memoryId)) {
+      continue;
+    }
+
+    try {
+      const row = params.db.prepare(`
+        SELECT
+          memory_id, confidence, truth_confidence, value_score, activation_strength,
+          reinforcement_count, last_reinforced_at, last_retrieved_at, updated_at, created_at
+        FROM memory_current
+        WHERE memory_id = ?
+        LIMIT 1
+      `).get(memoryId) as ReinforceableMemoryRow | undefined;
+      if (!row) {
+        continue;
+      }
+
+      const nextActivation = applyActivationEvent(
+        {
+          activation: clamp01(
+            toFiniteNumber(row.activation_strength)
+              ?? Math.max(
+                toFiniteNumber(row.truth_confidence)
+                  ?? toFiniteNumber(row.confidence)
+                  ?? 0.5,
+                toFiniteNumber(row.value_score) ?? 0.45,
+              ),
+          ),
+          reinforcementCount: Math.max(0, Math.trunc(toFiniteNumber(row.reinforcement_count) ?? 0)),
+          lastReinforcedAtMs: parseIsoDateMs(
+            row.last_reinforced_at ?? row.last_retrieved_at ?? row.updated_at ?? row.created_at,
+            nowMs,
+          ),
+        },
+        {
+          type: "retrieval",
+          atMs: nowMs,
+        },
+      );
+
+      params.db.prepare(`
+        UPDATE memory_current
+        SET activation_strength = ?,
+            reinforcement_count = ?,
+            retrieval_count = COALESCE(retrieval_count, 0) + 1,
+            last_reinforced_at = ?,
+            last_retrieved_at = ?
+        WHERE memory_id = ?
+      `).run(
+        nextActivation.activation,
+        nextActivation.reinforcementCount,
+        new Date(nextActivation.lastReinforcedAtMs).toISOString(),
+        now,
+        memoryId,
+      );
+
+      params.db.prepare(`
+        INSERT INTO memory_events (event_id, timestamp, component, action, memory_id, source, payload)
+        VALUES (hex(randomblob(16)), ?, 'memory_query', 'reinforce_query', ?, 'system', ?)
+      `).run(
+        now,
+        memoryId,
+        JSON.stringify({
+          surface: "memory_query",
+          strategy: params.strategy,
+          query: params.query,
+        }),
+      );
+    } catch (err) {
+      console.warn("[memory_query] reinforcement failed:", err);
+    }
+  }
 }
 
 function limitRecordCollection(
@@ -443,6 +561,13 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
 
       if (strategy === "entity_brief") {
         const result = buildEntityBrief(db, query, entityId);
+        reinforceReturnedMemories({
+          db,
+          config: input.config,
+          memoryIds: result.sourceIds,
+          query,
+          strategy,
+        });
         return jsonResult({
           strategy,
           query,
@@ -452,6 +577,13 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
 
       if (strategy === "relationship") {
         const result = buildRelationship(db, query);
+        reinforceReturnedMemories({
+          db,
+          config: input.config,
+          memoryIds: result.sourceIds,
+          query,
+          strategy,
+        });
         return jsonResult({
           strategy,
           query,
@@ -482,6 +614,13 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
           includeArchived,
           input.config,
         );
+        reinforceReturnedMemories({
+          db,
+          config: input.config,
+          memoryIds: result.sourceIds,
+          query,
+          strategy,
+        });
         return jsonResult({
           strategy,
           query,
@@ -520,9 +659,18 @@ export function createMemoryQueryTool(input: { config: LcmConfig }): AnyAgentToo
         search.memories.length > 0
           ? search.memories.map((memory) => `- [${memory.type}] ${memory.content}`).join("\n")
           : "No durable memory evidence found.";
+      const resolvedStrategy = strategy === "auto" ? "quick_context" : strategy;
+
+      reinforceReturnedMemories({
+        db,
+        config: input.config,
+        memoryIds: search.memories.map((memory) => memory.id),
+        query,
+        strategy: resolvedStrategy,
+      });
 
       return jsonResult({
-        strategy: strategy === "auto" ? "quick_context" : strategy,
+        strategy: resolvedStrategy,
         query,
         afterDate,
         beforeDate,

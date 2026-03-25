@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createMemoryAddTool } from "../src/surface/memory-add-tool.js";
+import { classifyValue } from "../src/memory/memory-utils.js";
+import { createMemoryAddTool, storeMemory } from "../src/surface/memory-add-tool.js";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { makeTestConfig } from "./test-config.js";
 
 const TEST_DB_PATH = ":memory:";
 
-function makeConfig(): LcmConfig {
+function makeConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
   return makeTestConfig({
     databasePath: TEST_DB_PATH,
     contextThreshold: 0.75,
@@ -25,7 +26,23 @@ function makeConfig(): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    ...overrides,
   });
+}
+
+function findArchiveCandidateContent(): string {
+  const candidates = [
+    "OpenClaw update: cron pipeline implementation notes",
+    "The script runs as part of the nightly cron pipeline",
+    "OpenClaw update: implementation notes for the cron pipeline",
+    "Context: cron pipeline and script follow-up",
+    "Release checklist for the cron pipeline implementation",
+  ];
+  const match = candidates.find((content) => classifyValue(content, "CONTEXT", 0.75).action === "archive");
+  if (!match) {
+    throw new Error("failed to find an archive-candidate sample for memory_add tests");
+  }
+  return match;
 }
 
 describe("memory_add tool", () => {
@@ -75,6 +92,9 @@ describe("memory_add tool", () => {
     expect(row).toBeDefined();
     expect(row?.type).toBe("USER_FACT");
     expect(row?.scope).toBe("shared");
+    expect(Number(row?.truth_confidence)).toBeGreaterThan(0);
+    expect(Number(row?.activation_strength)).toBeGreaterThan(0);
+    expect(Number(row?.reinforcement_count)).toBe(1);
   });
 
   it("rejects junk content", async () => {
@@ -191,5 +211,112 @@ describe("memory_add tool", () => {
     expect(event).toBeDefined();
     expect(event?.action).toBe("store");
     expect(event?.component).toBe("memory_add");
+  });
+
+  it("stores low-value classifications as active by default", async () => {
+    const content = findArchiveCandidateContent();
+    expect(classifyValue(content, "CONTEXT", 0.75).action).toBe("archive");
+
+    const tool = createMemoryAddTool({ config });
+    const result = await tool.execute("t13", {
+      content,
+      kind: "CONTEXT",
+    });
+
+    expect(result.details.stored).toBe(true);
+    expect(result.details.status).toBe("active");
+    expect(result.details.value_label).toBe("archive_candidate");
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const row = db
+      .prepare("SELECT status, archived_at, value_label, value_score FROM memory_current WHERE memory_id = ?")
+      .get(result.details.memoryId) as Record<string, unknown> | undefined;
+    expect(row?.status).toBe("active");
+    expect(row?.archived_at).toBeNull();
+    expect(row?.value_label).toBe("archive_candidate");
+    expect(Number(row?.value_score)).toBeLessThan(0.3);
+
+    const firstContent = result.content?.[0];
+    const text = firstContent?.type === "text" ? String(firstContent.text ?? "") : "";
+    expect(text).toContain("stored with a low-value ranking");
+    expect(text).not.toContain("archived");
+  });
+
+  it("rejects low-value archive candidates when skipArchiveCandidates is set", () => {
+    const content = findArchiveCandidateContent();
+    const db = getLcmConnection(TEST_DB_PATH);
+    const before = db
+      .prepare("SELECT COUNT(*) AS c FROM memory_current WHERE content = ?")
+      .get(content) as Record<string, unknown> | undefined;
+    const result = storeMemory({
+      config,
+      content,
+      kind: "CONTEXT",
+      skipArchiveCandidates: true,
+      source: "manual",
+      component: "memory_add",
+    });
+
+    expect(result.stored).toBe(false);
+    expect(result.reason).toBe("low_value");
+    expect(result.detail).toBe("archive_candidate");
+    expect(result.value_label).toBe("archive_candidate");
+    expect(result.value_score).toBeDefined();
+    expect(result.reason_codes).toContain("low_value");
+
+    const after = db
+      .prepare("SELECT COUNT(*) AS c FROM memory_current WHERE content = ?")
+      .get(content) as Record<string, unknown> | undefined;
+    expect(Number(after?.c)).toBe(Number(before?.c));
+  });
+
+  it("reinforces duplicate captures instead of writing a second row", async () => {
+    const tool = createMemoryAddTool({
+      config: makeConfig({
+        activationModelEnabled: true,
+        activationModelRolloutFraction: 1,
+      }),
+    });
+    const first = await tool.execute("t13", {
+      content: "Lucas prefers explicit rollout checklists before any deploy.",
+      kind: "PREFERENCE",
+    });
+    const second = await tool.execute("t14", {
+      content: "Lucas prefers explicit rollout checklists before any deploy.",
+      kind: "PREFERENCE",
+    });
+
+    expect(first.details.stored).toBe(true);
+    expect(second.details.stored).toBe(true);
+    expect(second.details.reinforced).toBe(true);
+    expect(second.details.memoryId).toBe(first.details.memoryId);
+
+    const db = getLcmConnection(TEST_DB_PATH);
+    const counts = db
+      .prepare("SELECT COUNT(*) AS c FROM memory_current WHERE type = ? AND content = ?")
+      .get("PREFERENCE", "Lucas prefers explicit rollout checklists before any deploy.") as Record<string, unknown>;
+    expect(Number(counts.c)).toBe(1);
+
+    const row = db
+      .prepare("SELECT reinforcement_count, activation_strength FROM memory_current WHERE memory_id = ?")
+      .get(first.details.memoryId) as Record<string, unknown> | undefined;
+    expect(Number(row?.reinforcement_count)).toBeGreaterThan(1);
+    expect(Number(row?.activation_strength)).toBeGreaterThan(0);
+  });
+
+  it("keeps legacy duplicate suppression when activation rollout is disabled", async () => {
+    const tool = createMemoryAddTool({ config: makeConfig() });
+    const first = await tool.execute("t15", {
+      content: "Lucas wants deploy notes attached to each release candidate.",
+      kind: "USER_FACT",
+    });
+    const second = await tool.execute("t16", {
+      content: "Lucas wants deploy notes attached to each release candidate.",
+      kind: "USER_FACT",
+    });
+
+    expect(first.details.stored).toBe(true);
+    expect(second.details.stored).toBe(false);
+    expect(second.details.reason).toBe("duplicate");
   });
 });
